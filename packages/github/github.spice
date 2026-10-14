@@ -1,0 +1,2860 @@
+// Std imports
+import "std/data/vector";
+import "std/net/http";
+import "std/net/http-client";
+import "std/os/env";
+import "std/text/json/json-value";
+import "std/text/analysis";
+import "std/text/json/json-parser";
+import "std/text/string-ext";
+import "std/type/type-conversion";
+
+// Own imports
+import "src/base64";
+import "src/json";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Client for the GitHub REST API (https://docs.github.com/rest).
+//
+// Every endpoint method returns a Result. On failure, the code of its Error is the HTTP status GitHub answered with
+// (e.g. 404), or ErrorCode::RuntimeError if no usable answer was received, and its message is a short static
+// description. The full message of GitHub, including validation details, is available in `GitHubClient.lastError`
+// until the next request.
+//
+// Listings are paginated. They return the requested page (1-based) with up to `GitHubClient.perPage` items, and
+// `GitHubClient.lastPageLinks` tells which other pages exist.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Constants
+public const string GITHUB_API_URL = "https://api.github.com";
+public const string GITHUB_API_VERSION = "2022-11-28";
+public const string GITHUB_MEDIA_TYPE = "application/vnd.github+json";
+public const string GITHUB_USER_AGENT = "spice-github/0.1.0";
+public const long GITHUB_DEFAULT_PER_PAGE = 30l;
+public const long GITHUB_MAX_PER_PAGE = 100l;
+
+const string HEADER_API_VERSION = "X-GitHub-Api-Version";
+const string HEADER_LINK = "Link";
+const string HEADER_RATE_LIMIT_LIMIT = "X-RateLimit-Limit";
+const string HEADER_RATE_LIMIT_REMAINING = "X-RateLimit-Remaining";
+const string HEADER_RATE_LIMIT_USED = "X-RateLimit-Used";
+const string HEADER_RATE_LIMIT_RESET = "X-RateLimit-Reset";
+const string HEADER_RATE_LIMIT_RESOURCE = "X-RateLimit-Resource";
+const string ERROR_INVALID_ANSWER = "GitHub sent an answer that could not be decoded";
+
+type T dyn;
+
+// ====================================================== Errors =======================================================
+
+/**
+ * Details of the last failed request
+ */
+public type GitHubError struct {
+    public unsigned short status = 0s // HTTP status, 0 if no answer was received at all
+    public String message             // Message of GitHub, or a description of why no answer was received
+    public String documentationUrl    // Link to the documentation of the endpoint, if GitHub sent one
+    public Vector<String> details     // Individual validation errors, e.g. "title: missing_field"
+}
+
+/**
+ * Resets the error to the state of a successful request
+ */
+public p GitHubError.clear() {
+    this.status = 0s;
+    this.message = String();
+    this.documentationUrl = String();
+    this.details.clear();
+}
+
+/**
+ * Returns the message together with all validation details, e.g. for printing
+ *
+ * @return Full description of the error
+ */
+public f<String> GitHubError.describe() {
+    result = String();
+    if this.status != 0s {
+        result += toString(cast<int>(this.status));
+        result += " ";
+    }
+    result += this.message;
+    for unsigned long i = 0l; i < this.details.getSize(); i++ {
+        result += i == 0l ? " (" : ", ";
+        result += this.details.get(i);
+    }
+    if !this.details.isEmpty() { result += ")"; }
+}
+
+// ===================================================== Pagination ====================================================
+
+/**
+ * Page numbers of the neighbors of the last requested page, as announced by GitHub. 0 means there is no such page.
+ */
+public type PageLinks struct {
+    public long next = 0l
+    public long prev = 0l
+    public long first = 0l
+    public long last = 0l
+}
+
+/**
+ * Checks whether there is a page after the one that was requested last
+ *
+ * @return Next page exists or not
+ */
+public f<bool> PageLinks.hasNext() {
+    return this.next != 0l;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Resources of the GitHub REST API.
+//
+// Every resource can be filled from the JSON GitHub sends for it via `loadJson`. Fields that GitHub leaves out or sends
+// as null keep their default: an empty string, 0 or false. Timestamps are kept as the ISO 8601 strings GitHub sends,
+// e.g. "2026-10-15T12:00:00Z".
+// ---------------------------------------------------------------------------------------------------------------------
+
+// ======================================================= Users =======================================================
+
+/**
+ * A user or an organization account
+ */
+public type User struct {
+    public long id = 0l
+    public String login
+    public String accountType // "User", "Organization" or "Bot"
+    public String name
+    public String email
+    public String bio
+    public String company
+    public String location
+    public String blog
+    public String avatarUrl
+    public String htmlUrl
+    public long publicRepos = 0l
+    public long followers = 0l
+    public long following = 0l
+    public String createdAt
+}
+
+/**
+ * Fills the user from its JSON representation
+ *
+ * @param json JSON object of the user
+ */
+public p User.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("login", this.login);
+    reader.readString("type", this.accountType);
+    reader.readString("name", this.name);
+    reader.readString("email", this.email);
+    reader.readString("bio", this.bio);
+    reader.readString("company", this.company);
+    reader.readString("location", this.location);
+    reader.readString("blog", this.blog);
+    reader.readString("avatar_url", this.avatarUrl);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readLong("public_repos", this.publicRepos);
+    reader.readLong("followers", this.followers);
+    reader.readLong("following", this.following);
+    reader.readString("created_at", this.createdAt);
+}
+
+// ==================================================== Repositories ===================================================
+
+/**
+ * A repository
+ */
+public type Repository struct {
+    public long id = 0l
+    public String name
+    public String fullName      // "owner/name"
+    public User owner
+    public String description
+    public bool isPrivate = false
+    public bool isFork = false
+    public bool isArchived = false
+    public bool isTemplate = false
+    public String visibility    // "public", "private" or "internal"
+    public String htmlUrl
+    public String cloneUrl
+    public String sshUrl
+    public String homepage
+    public String language
+    public String license       // SPDX identifier, e.g. "MIT"
+    public String defaultBranch
+    public Vector<String> topics
+    public long stargazersCount = 0l
+    public long watchersCount = 0l
+    public long forksCount = 0l
+    public long openIssuesCount = 0l
+    public long size = 0l       // In kilobytes
+    public String createdAt
+    public String updatedAt
+    public String pushedAt
+}
+
+/**
+ * Fills the repository from its JSON representation
+ *
+ * @param json JSON object of the repository
+ */
+public p Repository.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("name", this.name);
+    reader.readString("full_name", this.fullName);
+    this.owner.loadJson(reader.get("owner"));
+    reader.readString("description", this.description);
+    reader.readBool("private", this.isPrivate);
+    reader.readBool("fork", this.isFork);
+    reader.readBool("archived", this.isArchived);
+    reader.readBool("is_template", this.isTemplate);
+    reader.readString("visibility", this.visibility);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("clone_url", this.cloneUrl);
+    reader.readString("ssh_url", this.sshUrl);
+    reader.readString("homepage", this.homepage);
+    reader.readString("language", this.language);
+    JsonReader licenseReader = reader.child("license");
+    licenseReader.readString("spdx_id", this.license);
+    reader.readString("default_branch", this.defaultBranch);
+    reader.readStringArray("topics", this.topics);
+    reader.readLong("stargazers_count", this.stargazersCount);
+    reader.readLong("watchers_count", this.watchersCount);
+    reader.readLong("forks_count", this.forksCount);
+    reader.readLong("open_issues_count", this.openIssuesCount);
+    reader.readLong("size", this.size);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+    reader.readString("pushed_at", this.pushedAt);
+}
+
+/**
+ * A branch of a repository
+ */
+public type Branch struct {
+    public String name
+    public String commitSha
+    public bool isProtected = false
+}
+
+/**
+ * Fills the branch from its JSON representation
+ *
+ * @param json JSON object of the branch
+ */
+public p Branch.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("name", this.name);
+    JsonReader commit = reader.child("commit");
+    commit.readString("sha", this.commitSha);
+    reader.readBool("protected", this.isProtected);
+}
+
+/**
+ * A tag of a repository
+ */
+public type Tag struct {
+    public String name
+    public String commitSha
+    public String tarballUrl
+    public String zipballUrl
+}
+
+/**
+ * Fills the tag from its JSON representation
+ *
+ * @param json JSON object of the tag
+ */
+public p Tag.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("name", this.name);
+    JsonReader commit = reader.child("commit");
+    commit.readString("sha", this.commitSha);
+    reader.readString("tarball_url", this.tarballUrl);
+    reader.readString("zipball_url", this.zipballUrl);
+}
+
+/**
+ * A contributor of a repository, i.e. a user together with the number of commits they authored
+ */
+public type Contributor struct {
+    public String login
+    public long id = 0l
+    public String htmlUrl
+    public long contributions = 0l
+}
+
+/**
+ * Fills the contributor from its JSON representation
+ *
+ * @param json JSON object of the contributor
+ */
+public p Contributor.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("login", this.login);
+    reader.readLong("id", this.id);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readLong("contributions", this.contributions);
+}
+
+// ====================================================== Commits ======================================================
+
+/**
+ * A file touched by a commit or a pull request
+ */
+public type ChangedFile struct {
+    public String filename
+    public String previousFilename // Only set for renamed files
+    public String status           // "added", "removed", "modified", "renamed", "copied", "changed" or "unchanged"
+    public String sha
+    public long additions = 0l
+    public long deletions = 0l
+    public long changes = 0l
+    public String patch            // Unified diff, empty for binary or very large files
+}
+
+/**
+ * Fills the changed file from its JSON representation
+ *
+ * @param json JSON object of the file
+ */
+public p ChangedFile.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("filename", this.filename);
+    reader.readString("previous_filename", this.previousFilename);
+    reader.readString("status", this.status);
+    reader.readString("sha", this.sha);
+    reader.readLong("additions", this.additions);
+    reader.readLong("deletions", this.deletions);
+    reader.readLong("changes", this.changes);
+    reader.readString("patch", this.patch);
+}
+
+/**
+ * A commit
+ */
+public type Commit struct {
+    public String sha
+    public String message
+    public String htmlUrl
+    public String authorName     // Git author, as recorded in the commit
+    public String authorEmail
+    public String authorDate
+    public String committerName  // Git committer, as recorded in the commit
+    public String committerEmail
+    public String committerDate
+    public String authorLogin    // GitHub account of the author, empty if GitHub could not associate one
+    public Vector<String> parentShas
+    public long additions = 0l   // Stats and files are only filled when a single commit is requested
+    public long deletions = 0l
+    public Vector<ChangedFile> files
+}
+
+/**
+ * Fills the commit from its JSON representation
+ *
+ * @param json JSON object of the commit
+ */
+public p Commit.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("sha", this.sha);
+    reader.readString("html_url", this.htmlUrl);
+    JsonReader gitCommit = reader.child("commit");
+    gitCommit.readString("message", this.message);
+    JsonReader gitAuthor = gitCommit.child("author");
+    gitAuthor.readString("name", this.authorName);
+    gitAuthor.readString("email", this.authorEmail);
+    gitAuthor.readString("date", this.authorDate);
+    JsonReader gitCommitter = gitCommit.child("committer");
+    gitCommitter.readString("name", this.committerName);
+    gitCommitter.readString("email", this.committerEmail);
+    gitCommitter.readString("date", this.committerDate);
+    JsonReader author = reader.child("author");
+    author.readString("login", this.authorLogin);
+    const Vector<JsonValue*> parents = reader.items("parents");
+    for unsigned long i = 0l; i < parents.getSize(); i++ {
+        String parentSha;
+        JsonReader parent = JsonReader(parents.get(i));
+        parent.readString("sha", parentSha);
+        this.parentShas.pushBack(parentSha);
+    }
+    JsonReader stats = reader.child("stats");
+    stats.readLong("additions", this.additions);
+    stats.readLong("deletions", this.deletions);
+    const Vector<JsonValue*> fileItems = reader.items("files");
+    for unsigned long i = 0l; i < fileItems.getSize(); i++ {
+        ChangedFile file;
+        file.loadJson(fileItems.get(i));
+        this.files.pushBack(file);
+    }
+}
+
+// ====================================================== Contents =====================================================
+
+/**
+ * A file or directory entry of a repository
+ */
+public type Content struct {
+    public String kind        // "file", "dir", "symlink" or "submodule"
+    public String name
+    public String path
+    public String sha         // Blob sha, needed to update or delete the file
+    public long size = 0l
+    public String content     // Decoded file content, only filled when a single file is requested
+    public String htmlUrl
+    public String downloadUrl
+}
+
+/**
+ * Fills the entry from its JSON representation. The Base64 payload of files is not decoded here, see `GitHubClient.getFile`.
+ *
+ * @param json JSON object of the entry
+ */
+public p Content.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("type", this.kind);
+    reader.readString("name", this.name);
+    reader.readString("path", this.path);
+    reader.readString("sha", this.sha);
+    reader.readLong("size", this.size);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("download_url", this.downloadUrl);
+}
+
+/**
+ * Outcome of creating, updating or deleting a file through the contents API
+ */
+public type FileCommit struct {
+    public String contentSha   // New blob sha of the file, empty after a deletion
+    public String commitSha
+    public String commitHtmlUrl
+}
+
+/**
+ * Fills the outcome from its JSON representation
+ *
+ * @param json JSON object of the answer
+ */
+public p FileCommit.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    JsonReader content = reader.child("content");
+    content.readString("sha", this.contentSha);
+    JsonReader commit = reader.child("commit");
+    commit.readString("sha", this.commitSha);
+    commit.readString("html_url", this.commitHtmlUrl);
+}
+
+// ======================================================= Issues ======================================================
+
+/**
+ * A label of issues and pull requests
+ */
+public type Label struct {
+    public long id = 0l
+    public String name
+    public String color   // Hex color without the leading '#'
+    public String description
+}
+
+/**
+ * Fills the label from its JSON representation
+ *
+ * @param json JSON object of the label
+ */
+public p Label.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("name", this.name);
+    reader.readString("color", this.color);
+    reader.readString("description", this.description);
+}
+
+/**
+ * A milestone of issues and pull requests
+ */
+public type Milestone struct {
+    public long id = 0l
+    public long number = 0l   // 0 if the issue has no milestone
+    public String title
+    public String description
+    public String state       // "open" or "closed"
+    public long openIssues = 0l
+    public long closedIssues = 0l
+    public String dueOn
+}
+
+/**
+ * Fills the milestone from its JSON representation
+ *
+ * @param json JSON object of the milestone
+ */
+public p Milestone.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readLong("number", this.number);
+    reader.readString("title", this.title);
+    reader.readString("description", this.description);
+    reader.readString("state", this.state);
+    reader.readLong("open_issues", this.openIssues);
+    reader.readLong("closed_issues", this.closedIssues);
+    reader.readString("due_on", this.dueOn);
+}
+
+/**
+ * Fills the labels from the "labels" field of an issue or pull request
+ */
+p loadLabels(JsonReader& reader, Vector<Label>& labels) {
+    const Vector<JsonValue*> items = reader.items("labels");
+    for unsigned long i = 0l; i < items.getSize(); i++ {
+        Label label;
+        label.loadJson(items.get(i));
+        labels.pushBack(label);
+    }
+}
+
+/**
+ * Fills the users from an array field of an issue or pull request
+ */
+p loadUsers(JsonReader& reader, string key, Vector<User>& users) {
+    const Vector<JsonValue*> items = reader.items(key);
+    for unsigned long i = 0l; i < items.getSize(); i++ {
+        User user;
+        user.loadJson(items.get(i));
+        users.pushBack(user);
+    }
+}
+
+/**
+ * An issue. GitHub treats every pull request as an issue as well, so issue listings contain pull requests, which are
+ * marked by `isPullRequest`.
+ */
+public type Issue struct {
+    public long id = 0l
+    public long number = 0l
+    public String title
+    public String body
+    public String state         // "open" or "closed"
+    public String stateReason   // "completed", "not_planned", "reopened" or empty
+    public User user
+    public Vector<Label> labels
+    public Vector<User> assignees
+    public Milestone milestone
+    public long comments = 0l
+    public bool isLocked = false
+    public bool isPullRequest = false
+    public String htmlUrl
+    public String createdAt
+    public String updatedAt
+    public String closedAt
+}
+
+/**
+ * Fills the issue from its JSON representation
+ *
+ * @param json JSON object of the issue
+ */
+public p Issue.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readLong("number", this.number);
+    reader.readString("title", this.title);
+    reader.readString("body", this.body);
+    reader.readString("state", this.state);
+    reader.readString("state_reason", this.stateReason);
+    this.user.loadJson(reader.get("user"));
+    loadLabels(reader, this.labels);
+    loadUsers(reader, "assignees", this.assignees);
+    this.milestone.loadJson(reader.get("milestone"));
+    reader.readLong("comments", this.comments);
+    reader.readBool("locked", this.isLocked);
+    this.isPullRequest = reader.has("pull_request");
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+    reader.readString("closed_at", this.closedAt);
+}
+
+/**
+ * A comment on an issue or on the conversation of a pull request
+ */
+public type Comment struct {
+    public long id = 0l
+    public String body
+    public User user
+    public String htmlUrl
+    public String createdAt
+    public String updatedAt
+}
+
+/**
+ * Fills the comment from its JSON representation
+ *
+ * @param json JSON object of the comment
+ */
+public p Comment.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("body", this.body);
+    this.user.loadJson(reader.get("user"));
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+}
+
+// =================================================== Pull requests ===================================================
+
+/**
+ * One end of a pull request: the branch it merges from (head) or into (base)
+ */
+public type PullRequestRef struct {
+    public String label     // "owner:branch"
+    public String ref       // Branch name
+    public String sha
+    public String repoFullName
+}
+
+/**
+ * Fills the reference from its JSON representation
+ *
+ * @param json JSON object of the reference
+ */
+public p PullRequestRef.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readString("label", this.label);
+    reader.readString("ref", this.ref);
+    reader.readString("sha", this.sha);
+    JsonReader repo = reader.child("repo");
+    repo.readString("full_name", this.repoFullName);
+}
+
+/**
+ * A pull request
+ */
+public type PullRequest struct {
+    public long id = 0l
+    public long number = 0l
+    public String title
+    public String body
+    public String state           // "open" or "closed"
+    public bool isDraft = false
+    public bool isMerged = false
+    public bool isLocked = false
+    public String mergeableState  // "clean", "dirty", "blocked", "behind", "unstable", "unknown", ... - only for single PRs
+    public User user
+    public PullRequestRef head
+    public PullRequestRef base
+    public Vector<Label> labels
+    public Vector<User> assignees
+    public Vector<User> requestedReviewers
+    public Milestone milestone
+    public String mergeCommitSha
+    public long commits = 0l      // Counts are only filled when a single pull request is requested
+    public long additions = 0l
+    public long deletions = 0l
+    public long changedFiles = 0l
+    public long comments = 0l
+    public String htmlUrl
+    public String diffUrl
+    public String createdAt
+    public String updatedAt
+    public String closedAt
+    public String mergedAt
+}
+
+/**
+ * Fills the pull request from its JSON representation
+ *
+ * @param json JSON object of the pull request
+ */
+public p PullRequest.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readLong("number", this.number);
+    reader.readString("title", this.title);
+    reader.readString("body", this.body);
+    reader.readString("state", this.state);
+    reader.readBool("draft", this.isDraft);
+    reader.readBool("merged", this.isMerged);
+    reader.readBool("locked", this.isLocked);
+    reader.readString("mergeable_state", this.mergeableState);
+    this.user.loadJson(reader.get("user"));
+    this.head.loadJson(reader.get("head"));
+    this.base.loadJson(reader.get("base"));
+    loadLabels(reader, this.labels);
+    loadUsers(reader, "assignees", this.assignees);
+    loadUsers(reader, "requested_reviewers", this.requestedReviewers);
+    this.milestone.loadJson(reader.get("milestone"));
+    reader.readString("merge_commit_sha", this.mergeCommitSha);
+    reader.readLong("commits", this.commits);
+    reader.readLong("additions", this.additions);
+    reader.readLong("deletions", this.deletions);
+    reader.readLong("changed_files", this.changedFiles);
+    reader.readLong("comments", this.comments);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("diff_url", this.diffUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+    reader.readString("closed_at", this.closedAt);
+    reader.readString("merged_at", this.mergedAt);
+    // Listings carry no "merged" field, but a merge timestamp tells the same
+    if !this.mergedAt.isEmpty() { this.isMerged = true; }
+}
+
+/**
+ * A review of a pull request
+ */
+public type Review struct {
+    public long id = 0l
+    public User user
+    public String body
+    public String state      // "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED" or "PENDING"
+    public String commitId
+    public String htmlUrl
+    public String submittedAt
+}
+
+/**
+ * Fills the review from its JSON representation
+ *
+ * @param json JSON object of the review
+ */
+public p Review.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    this.user.loadJson(reader.get("user"));
+    reader.readString("body", this.body);
+    reader.readString("state", this.state);
+    reader.readString("commit_id", this.commitId);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("submitted_at", this.submittedAt);
+}
+
+/**
+ * Outcome of merging a pull request
+ */
+public type MergeResult struct {
+    public bool isMerged = false
+    public String sha
+    public String message
+}
+
+/**
+ * Fills the outcome from its JSON representation
+ *
+ * @param json JSON object of the answer
+ */
+public p MergeResult.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readBool("merged", this.isMerged);
+    reader.readString("sha", this.sha);
+    reader.readString("message", this.message);
+}
+
+// ===================================================== Releases ======================================================
+
+/**
+ * A file attached to a release
+ */
+public type ReleaseAsset struct {
+    public long id = 0l
+    public String name
+    public String label
+    public String contentType
+    public String state
+    public long size = 0l
+    public long downloadCount = 0l
+    public String browserDownloadUrl
+    public String createdAt
+    public String updatedAt
+}
+
+/**
+ * Fills the asset from its JSON representation
+ *
+ * @param json JSON object of the asset
+ */
+public p ReleaseAsset.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("name", this.name);
+    reader.readString("label", this.label);
+    reader.readString("content_type", this.contentType);
+    reader.readString("state", this.state);
+    reader.readLong("size", this.size);
+    reader.readLong("download_count", this.downloadCount);
+    reader.readString("browser_download_url", this.browserDownloadUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+}
+
+/**
+ * A release
+ */
+public type Release struct {
+    public long id = 0l
+    public String tagName
+    public String targetCommitish
+    public String name
+    public String body
+    public bool isDraft = false
+    public bool isPrerelease = false
+    public User author
+    public Vector<ReleaseAsset> assets
+    public String htmlUrl
+    public String tarballUrl
+    public String zipballUrl
+    public String createdAt
+    public String publishedAt
+}
+
+/**
+ * Fills the release from its JSON representation
+ *
+ * @param json JSON object of the release
+ */
+public p Release.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("tag_name", this.tagName);
+    reader.readString("target_commitish", this.targetCommitish);
+    reader.readString("name", this.name);
+    reader.readString("body", this.body);
+    reader.readBool("draft", this.isDraft);
+    reader.readBool("prerelease", this.isPrerelease);
+    this.author.loadJson(reader.get("author"));
+    const Vector<JsonValue*> assetItems = reader.items("assets");
+    for unsigned long i = 0l; i < assetItems.getSize(); i++ {
+        ReleaseAsset asset;
+        asset.loadJson(assetItems.get(i));
+        this.assets.pushBack(asset);
+    }
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("tarball_url", this.tarballUrl);
+    reader.readString("zipball_url", this.zipballUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("published_at", this.publishedAt);
+}
+
+// ====================================================== Actions ======================================================
+
+/**
+ * A GitHub Actions workflow
+ */
+public type Workflow struct {
+    public long id = 0l
+    public String name
+    public String path     // e.g. ".github/workflows/ci.yml"
+    public String state    // "active", "disabled_manually", ...
+    public String htmlUrl
+    public String badgeUrl
+    public String createdAt
+    public String updatedAt
+}
+
+/**
+ * Fills the workflow from its JSON representation
+ *
+ * @param json JSON object of the workflow
+ */
+public p Workflow.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readString("name", this.name);
+    reader.readString("path", this.path);
+    reader.readString("state", this.state);
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("badge_url", this.badgeUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+}
+
+/**
+ * A run of a GitHub Actions workflow
+ */
+public type WorkflowRun struct {
+    public long id = 0l
+    public long workflowId = 0l
+    public long runNumber = 0l
+    public long runAttempt = 0l
+    public String name
+    public String displayTitle
+    public String event        // e.g. "push", "pull_request", "workflow_dispatch"
+    public String status       // "queued", "in_progress", "completed", ...
+    public String conclusion   // "success", "failure", "cancelled", "skipped", ... - empty while running
+    public String headBranch
+    public String headSha
+    public User actor
+    public String htmlUrl
+    public String createdAt
+    public String updatedAt
+}
+
+/**
+ * Fills the workflow run from its JSON representation
+ *
+ * @param json JSON object of the run
+ */
+public p WorkflowRun.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("id", this.id);
+    reader.readLong("workflow_id", this.workflowId);
+    reader.readLong("run_number", this.runNumber);
+    reader.readLong("run_attempt", this.runAttempt);
+    reader.readString("name", this.name);
+    reader.readString("display_title", this.displayTitle);
+    reader.readString("event", this.event);
+    reader.readString("status", this.status);
+    reader.readString("conclusion", this.conclusion);
+    reader.readString("head_branch", this.headBranch);
+    reader.readString("head_sha", this.headSha);
+    this.actor.loadJson(reader.get("actor"));
+    reader.readString("html_url", this.htmlUrl);
+    reader.readString("created_at", this.createdAt);
+    reader.readString("updated_at", this.updatedAt);
+}
+
+// ===================================================== Rate limit ====================================================
+
+/**
+ * Request quota of the client, as reported by GitHub
+ */
+public type RateLimit struct {
+    public long limit = 0l      // Requests allowed per window
+    public long remaining = 0l  // Requests left in the current window
+    public long used = 0l       // Requests used in the current window
+    public long reset = 0l      // Unix time in seconds at which the window resets
+    public String resource      // Quota the numbers belong to, e.g. "core" or "search"
+}
+
+/**
+ * Fills the quota from its JSON representation
+ *
+ * @param json JSON object of the quota
+ */
+public p RateLimit.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("limit", this.limit);
+    reader.readLong("remaining", this.remaining);
+    reader.readLong("used", this.used);
+    reader.readLong("reset", this.reset);
+    reader.readString("resource", this.resource);
+}
+
+// ================================================ Resource wrappers =================================================
+
+/**
+ * A page of search results
+ */
+public type SearchResult<T> struct {
+    public long totalCount = 0l
+    public bool isIncomplete = false  // GitHub hit its time limit and the result may be missing matches
+    public Vector<T> items
+}
+
+/**
+ * Constructs an empty search result
+ */
+public p SearchResult.ctor() {}
+
+/**
+ * Destructs the search result. Explicit for the same reason as CountedList.dtor
+ */
+public p SearchResult.dtor() {}
+
+/**
+ * Fills the search result from its JSON representation
+ *
+ * @param json JSON object of the answer
+ */
+public p SearchResult.loadJson(JsonValue* json) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("total_count", this.totalCount);
+    reader.readBool("incomplete_results", this.isIncomplete);
+    loadItems(reader, "items", this.items);
+}
+
+/**
+ * A page of a listing that GitHub wraps into an object together with the total count, like the workflows of a repository
+ */
+public type CountedList<T> struct {
+    public long totalCount = 0l
+    public Vector<T> items
+}
+
+/**
+ * Constructs an empty listing
+ */
+public p CountedList.ctor() {}
+
+/**
+ * Destructs the listing. The fields are destructed implicitly, but without an explicit ctor and dtor, Spice 0.29.0 does
+ * not emit them for every manifestation (e.g. CountedList<Workflow>)
+ */
+public p CountedList.dtor() {}
+
+/**
+ * Fills the items of the given key from a counted listing
+ *
+ * @param json JSON object of the answer
+ * @param key Key of the array that holds the items
+ */
+public p CountedList.loadJson(JsonValue* json, string key) {
+    JsonReader reader = JsonReader(json);
+    reader.readLong("total_count", this.totalCount);
+    loadItems(reader, key, this.items);
+}
+
+/**
+ * Decodes the items of an array field into resources
+ */
+p loadItems<T>(JsonReader& reader, string key, Vector<T>& target) {
+    const Vector<JsonValue*> items = reader.items(key);
+    for unsigned long i = 0l; i < items.getSize(); i++ {
+        T item = T(); // Explicitly constructed, see GitHubClient.requestObject
+        item.loadJson(items.get(i));
+        target.pushBack(item);
+    }
+}
+
+// ======================================================= Inputs ======================================================
+
+/**
+ * Filter for listing repositories of a user, an organization or the authenticated user. Empty fields are not sent.
+ */
+public type RepositoryFilter struct {
+    public String repoType   // "all", "owner", "public", "private", "member" (users) or "forks", "sources" (orgs)
+    public String visibility // "all", "public" or "private" (authenticated user only)
+    public String sort       // "created", "updated", "pushed" or "full_name"
+    public String direction  // "asc" or "desc"
+}
+
+/**
+ * Settings of a new repository
+ */
+public type NewRepository struct {
+    public String name
+    public String description
+    public String homepage
+    public bool isPrivate = false
+    public bool autoInit = false      // Create an initial commit with an empty README
+    public String gitignoreTemplate   // e.g. "C++"
+    public String licenseTemplate     // e.g. "mit"
+}
+
+/**
+ * Filter for listing commits. Empty fields are not sent.
+ */
+public type CommitFilter struct {
+    public String sha     // Branch name or sha to start from, the default branch if empty
+    public String path    // Only commits touching this path
+    public String author  // GitHub login or email address
+    public String since   // ISO 8601 timestamp
+    public String until   // ISO 8601 timestamp
+}
+
+/**
+ * A change to a file through the contents API
+ */
+public type FileChange struct {
+    public String message        // Commit message
+    public String content        // New file content (raw, the client encodes it), unused for deletions
+    public String sha            // Blob sha of the file being replaced or deleted, empty to create a new file
+    public String branch         // Target branch, the default branch if empty
+    public String committerName  // Committer, the authenticated user if empty
+    public String committerEmail
+}
+
+/**
+ * Filter for listing issues. Empty fields are not sent.
+ */
+public type IssueFilter struct {
+    public String state      // "open" (default), "closed" or "all"
+    public String labels     // Comma-separated label names
+    public String assignee   // Login, "none" or "*"
+    public String creator    // Login
+    public String mentioned  // Login
+    public String milestone  // Milestone number, "none" or "*"
+    public String sort       // "created", "updated" or "comments"
+    public String direction  // "asc" or "desc"
+    public String since      // ISO 8601 timestamp
+}
+
+/**
+ * Fields of an issue to create or to update. When updating, empty strings, empty lists and a milestone of 0 are left
+ * unchanged.
+ */
+public type IssueChange struct {
+    public String title
+    public String body
+    public String state          // "open" or "closed", update only
+    public String stateReason    // "completed", "not_planned" or "reopened", update only
+    public Vector<String> labels
+    public Vector<String> assignees
+    public long milestone = 0l
+}
+
+/**
+ * Filter for listing pull requests. Empty fields are not sent.
+ */
+public type PullRequestFilter struct {
+    public String state      // "open" (default), "closed" or "all"
+    public String head       // "user:branch"
+    public String base       // Base branch name
+    public String sort       // "created", "updated", "popularity" or "long-running"
+    public String direction  // "asc" or "desc"
+}
+
+/**
+ * Settings of a new pull request
+ */
+public type NewPullRequest struct {
+    public String title
+    public String head       // Branch to merge, "user:branch" for branches of forks
+    public String base       // Branch to merge into
+    public String body
+    public bool isDraft = false
+    public bool maintainerCanModify = true
+}
+
+/**
+ * Fields of a pull request to update. Empty strings are left unchanged.
+ */
+public type PullRequestChange struct {
+    public String title
+    public String body
+    public String state      // "open" or "closed"
+    public String base
+}
+
+/**
+ * Settings for merging a pull request. Empty strings fall back to the defaults of GitHub.
+ */
+public type MergeOptions struct {
+    public String method         // "merge" (default), "squash" or "rebase"
+    public String commitTitle
+    public String commitMessage
+    public String sha            // Only merge if the head still points at this sha
+}
+
+/**
+ * Settings of a new release
+ */
+public type NewRelease struct {
+    public String tagName
+    public String targetCommitish   // Branch or sha to tag, if the tag does not exist yet. The default branch if empty
+    public String name
+    public String body
+    public bool isDraft = false
+    public bool isPrerelease = false
+    public bool generateReleaseNotes = false
+}
+
+/**
+ * Filter for listing workflow runs. Empty fields are not sent.
+ */
+public type WorkflowRunFilter struct {
+    public String workflow  // Workflow id or file name, e.g. "ci.yml". All workflows if empty
+    public String branch
+    public String event     // e.g. "push"
+    public String status    // e.g. "completed", "success", "failure", "in_progress"
+    public String actor     // Login
+}
+
+/**
+ * Trigger of a workflow with the workflow_dispatch event
+ */
+public type WorkflowDispatch struct {
+    public String ref         // Branch or tag to run the workflow on
+    Vector<String> inputNames
+    Vector<String> inputValues
+}
+
+/**
+ * Constructs a trigger for the given ref
+ *
+ * @param ref Branch or tag to run the workflow on
+ */
+public p WorkflowDispatch.ctor(string ref) {
+    this.ref = String(ref);
+}
+
+/**
+ * Adds an input of the workflow
+ *
+ * @param name Input name, as declared in the workflow
+ * @param value Input value
+ */
+public p WorkflowDispatch.addInput(string name, string value) {
+    this.inputNames.pushBack(String(name));
+    this.inputValues.pushBack(String(value));
+}
+
+/**
+ * Sort order of search results. Empty fields fall back to the best match.
+ */
+public type SearchOptions struct {
+    public String sort   // e.g. "stars", "forks", "updated" (repositories) or "comments", "created" (issues)
+    public String order  // "asc" or "desc"
+}
+
+// ======================================================= Client ======================================================
+
+/**
+ * Client for the GitHub REST API
+ */
+public type GitHubClient struct {
+    public String baseUrl           // API root without trailing slash, "https://<host>/api/v3" for GitHub Enterprise
+    public long perPage             // Page size of listings, at most GITHUB_MAX_PER_PAGE
+    public GitHubError lastError    // Details of the last failed request
+    public RateLimit rateLimit      // Quota as of the last answer
+    public PageLinks lastPageLinks  // Neighbors of the last requested page
+    String token
+    HttpClient http
+}
+
+/**
+ * Constructs a client for api.github.com
+ *
+ * @param token Personal access token, GitHub App token or OAuth token. Empty for anonymous access, which is limited to
+ *              public data and 60 requests per hour
+ */
+public p GitHubClient.ctor(string token = "") {
+    this.baseUrl = String(GITHUB_API_URL);
+    this.perPage = GITHUB_DEFAULT_PER_PAGE;
+    this.token = String(token);
+    this.http.setDefaultHeader(HEADER_ACCEPT, GITHUB_MEDIA_TYPE);
+    this.http.setDefaultHeader(HEADER_USER_AGENT, GITHUB_USER_AGENT);
+    this.http.setDefaultHeader(HEADER_API_VERSION, GITHUB_API_VERSION);
+}
+
+/**
+ * Sets the token to authenticate with
+ *
+ * @param token Token, empty for anonymous access
+ */
+public p GitHubClient.setToken(string token) {
+    this.token = String(token);
+}
+
+/**
+ * Loads the token from the environment variable GITHUB_TOKEN, falling back to GH_TOKEN
+ *
+ * @return Whether a token was found
+ */
+public f<bool> GitHubClient.loadTokenFromEnv() {
+    Result<string> envToken = getEnv("GITHUB_TOKEN");
+    if envToken.isErr() { envToken = getEnv("GH_TOKEN"); }
+    if envToken.isErr() { return false; }
+    this.token = String(envToken.unwrap());
+    return !this.token.isEmpty();
+}
+
+/**
+ * Checks whether the client sends a token
+ *
+ * @return Authenticated or not
+ */
+public f<bool> GitHubClient.isAuthenticated() {
+    return !this.token.isEmpty();
+}
+
+/**
+ * Points the client at another API root, e.g. a GitHub Enterprise Server
+ *
+ * @param baseUrl API root, e.g. "https://github.example.com/api/v3"
+ */
+public p GitHubClient.setBaseUrl(string baseUrl) {
+    this.baseUrl = String(baseUrl);
+    while this.baseUrl.endsWith("/") {
+        this.baseUrl = this.baseUrl.getSubstring(0l, cast<long>(this.baseUrl.getLength()) - 1l);
+    }
+}
+
+/**
+ * Sets the User-Agent header. GitHub asks to identify the application with it
+ *
+ * @param userAgent Name of the application, e.g. "my-app/1.0"
+ */
+public p GitHubClient.setUserAgent(string userAgent) {
+    this.http.setDefaultHeader(HEADER_USER_AGENT, userAgent);
+}
+
+/**
+ * Sets the timeout for reading from and writing to the connection
+ *
+ * @param timeoutMillis Timeout in milliseconds, 0 to block indefinitely
+ */
+public p GitHubClient.setTimeout(unsigned long timeoutMillis) {
+    this.http.timeoutMillis = timeoutMillis;
+}
+
+// ===================================================== Requests ======================================================
+
+/**
+ * Sends a request to the API and returns the answer, whatever its status. Use this for endpoints this client has no
+ * method for. Failed requests (non-2xx) are recorded in `lastError` all the same.
+ *
+ * @param method Request method
+ * @param path Path below the API root, e.g. "/repos/spicelang/spice", or an absolute URL
+ * @param body JSON payload, may be empty
+ * @return The answer, or an error if none was received
+ */
+public f<Result<HttpResponse>> GitHubClient.request(HttpMethod method, const String& path, const String& body) {
+    this.lastError.clear();
+    this.lastPageLinks = PageLinks();
+
+    HttpRequest request = HttpRequest(method, "/");
+    if !this.token.isEmpty() {
+        const String authorization = String("Bearer ") + this.token;
+        request.headers.set(HEADER_AUTHORIZATION, authorization);
+    }
+    // GitHub insists on a Content-Length for every write, even without payload
+    if !body.isEmpty() || method == HttpMethod::POST || method == HttpMethod::PUT || method == HttpMethod::PATCH {
+        request.setBody(body, CONTENT_TYPE_JSON);
+    }
+    const String url = path.startsWith("https://") || path.startsWith("http://") ? path : this.baseUrl + path;
+
+    Result<HttpResponse> answer = this.http.send(request, url);
+    if answer.isErr() {
+        const Error& error = answer.getErr();
+        this.lastError.message = String(error.getMessage());
+        return answer;
+    }
+    const HttpResponse& response = answer.unwrap();
+    this.readRateLimit(response.headers);
+    const String link = response.headers.get(HEADER_LINK);
+    if !link.isEmpty() { this.lastPageLinks = parsePageLinks(link); }
+    if !response.isSuccess() { this.readError(response); }
+    return answer;
+}
+
+/**
+ * Sends a request and decodes the answer into a resource, e.g. `client.requestObject<Repository>(...)`
+ *
+ * @param method Request method
+ * @param path Path below the API root, or an absolute URL
+ * @param body JSON payload, may be empty
+ * @return The decoded resource
+ */
+public f<Result<T>> GitHubClient.requestObject<T>(HttpMethod method, const String& path, const String& body) {
+    // Explicitly constructed, since `T value;` calls the ctor of another manifestation (Spice 0.29.0)
+    T value = T();
+    Result<bool> loaded = this.requestInto<T>(method, path, body, value);
+    if loaded.isErr() { return err<T>(loaded.getErr()); }
+    return ok(value);
+}
+
+/**
+ * Sends a request and decodes the answer into the given resource. Unlike `requestObject`, this also works for resources
+ * that are generic themselves, like `SearchResult<Repository>`
+ *
+ * @param method Request method
+ * @param path Path below the API root, or an absolute URL
+ * @param body JSON payload, may be empty
+ * @param target Resource to fill
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.requestInto<T>(HttpMethod method, const String& path, const String& body, T& target) {
+    Result<JsonValue*> json = this.requestJson(method, path, body);
+    if json.isErr() { return err<bool>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    if !root.isObject() {
+        deleteJsonValue(root);
+        return this.failDecoding<bool>();
+    }
+    target.loadJson(root);
+    deleteJsonValue(root);
+    return ok(true);
+}
+
+/**
+ * Sends a request and decodes the answer into a list of resources, e.g. `client.requestList<Issue>(...)`
+ *
+ * @param method Request method
+ * @param path Path below the API root, or an absolute URL
+ * @param body JSON payload, may be empty
+ * @return The decoded resources
+ */
+public f<Result<Vector<T>>> GitHubClient.requestList<T>(HttpMethod method, const String& path, const String& body) {
+    Result<JsonValue*> json = this.requestJson(method, path, body);
+    if json.isErr() { return err<Vector<T>>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    Vector<T> items;
+    if !root.isArray() {
+        deleteJsonValue(root);
+        return this.failDecoding<Vector<T>>();
+    }
+    for unsigned long i = 0l; i < root.getArraySize(); i++ {
+        T item = T(); // See requestObject
+        item.loadJson(root.getArrayItem(i));
+        items.pushBack(item);
+    }
+    deleteJsonValue(root);
+    return ok(items);
+}
+
+/**
+ * Sends a request whose answer carries no data of interest, like a deletion
+ *
+ * @param method Request method
+ * @param path Path below the API root, or an absolute URL
+ * @param body JSON payload, may be empty
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.requestNoContent(HttpMethod method, const String& path, const String& body) {
+    Result<HttpResponse> response = this.request(method, path, body);
+    if response.isErr() { return err<bool>(response.getErr()); }
+    const HttpResponse& answer = response.unwrap();
+    if !answer.isSuccess() { return statusError<bool>(answer.statusCode); }
+    return ok(true);
+}
+
+/**
+ * Sends a request and parses the answer. The caller owns the returned tree and releases it with deleteJsonValue.
+ */
+f<Result<JsonValue*>> GitHubClient.requestJson(HttpMethod method, const String& path, const String& body) {
+    Result<HttpResponse> response = this.request(method, path, body);
+    if response.isErr() { return err<JsonValue*>(response.getErr()); }
+    const HttpResponse& answer = response.unwrap();
+    if !answer.isSuccess() { return statusError<JsonValue*>(answer.statusCode); }
+    Result<JsonValue*> json = parseJson(answer.body);
+    if json.isErr() { return this.failDecoding<JsonValue*>(); }
+    return json;
+}
+
+/**
+ * Records an answer that could not be decoded
+ */
+f<Result<T>> GitHubClient.failDecoding<T>() {
+    this.lastError.message = String(ERROR_INVALID_ANSWER);
+    return err<T>(ERROR_INVALID_ANSWER);
+}
+
+/**
+ * Builds the error result for an answer with the given status
+ */
+f<Result<T>> statusError<T>(unsigned short status) {
+    return err<T>(cast<int>(status), getReasonPhrase(status));
+}
+
+/**
+ * Takes the quota from the rate limit headers of an answer
+ */
+p GitHubClient.readRateLimit(const HttpHeaders& headers) {
+    if !headers.contains(HEADER_RATE_LIMIT_LIMIT) { return; }
+    this.rateLimit.limit = parseLongHeader(headers, HEADER_RATE_LIMIT_LIMIT);
+    this.rateLimit.remaining = parseLongHeader(headers, HEADER_RATE_LIMIT_REMAINING);
+    this.rateLimit.used = parseLongHeader(headers, HEADER_RATE_LIMIT_USED);
+    this.rateLimit.reset = parseLongHeader(headers, HEADER_RATE_LIMIT_RESET);
+    this.rateLimit.resource = headers.get(HEADER_RATE_LIMIT_RESOURCE);
+}
+
+f<long> parseLongHeader(const HttpHeaders& headers, string name) {
+    const String value = headers.get(name);
+    return value.isEmpty() ? 0l : toLong(value.getRaw());
+}
+
+/**
+ * Takes the details of a failed request from the answer. GitHub sends errors as
+ * {"message": "...", "documentation_url": "...", "errors": [{"field": "...", "code": "...", "message": "..."}]}
+ */
+p GitHubClient.readError(const HttpResponse& response) {
+    this.lastError.status = response.statusCode;
+    this.lastError.message = String(getReasonPhrase(response.statusCode));
+    Result<JsonValue*> parsed = parseJson(response.body);
+    if parsed.isErr() { return; }
+    JsonValue* json = parsed.unwrap();
+    JsonReader reader = JsonReader(json);
+    reader.readString("message", this.lastError.message);
+    reader.readString("documentation_url", this.lastError.documentationUrl);
+    const Vector<JsonValue*> errors = reader.items("errors");
+    for unsigned long i = 0l; i < errors.getSize(); i++ {
+        JsonValue* item = errors.get(i);
+        if item.isString() {
+            this.lastError.details.pushBack(item.getString());
+            continue;
+        }
+        JsonReader entry = JsonReader(item);
+        String detail;
+        entry.readString("message", detail);
+        if detail.isEmpty() {
+            String field;
+            String code;
+            entry.readString("field", field);
+            entry.readString("code", code);
+            detail = field.isEmpty() ? code : field + ": " + code;
+        }
+        if !detail.isEmpty() { this.lastError.details.pushBack(detail); }
+    }
+    deleteJsonValue(json);
+}
+
+/**
+ * Extracts the page numbers from a Link header like `<https://api.github.com/...?page=2>; rel="next", <...>; rel="last"`
+ *
+ * @param header Value of the Link header
+ * @return Page numbers found in the header
+ */
+f<PageLinks> parsePageLinks(const String& header) {
+    PageLinks links;
+    const Vector<String> parts = split(header, ',');
+    for unsigned long i = 0l; i < parts.getSize(); i++ {
+        const String& part = parts.get(i);
+        const long urlStart = part.find('<');
+        const long urlEnd = part.find('>');
+        if urlStart == -1l || urlEnd <= urlStart { continue; }
+        const String url = part.getSubstring(cast<unsigned long>(urlStart + 1l), urlEnd - urlStart - 1l);
+        const long page = getPageParam(url);
+        if part.contains("rel=\"next\"") { links.next = page; }
+        if part.contains("rel=\"prev\"") { links.prev = page; }
+        if part.contains("rel=\"first\"") { links.first = page; }
+        if part.contains("rel=\"last\"") { links.last = page; }
+    }
+    return links;
+}
+
+/**
+ * Returns the value of the page parameter of a URL, or 0 if there is none
+ */
+f<long> getPageParam(const String& url) {
+    long start = url.find("?page=");
+    if start == -1l { start = url.find("&page="); }
+    if start == -1l { return 0l; }
+    const unsigned long digitsStart = cast<unsigned long>(start + 6l);
+    unsigned long digitsEnd = digitsStart;
+    while digitsEnd < url.getLength() && isDigit(url[digitsEnd]) { digitsEnd++; }
+    if digitsEnd == digitsStart { return 0l; }
+    const String digits = url.getSubstring(digitsStart, cast<long>(digitsEnd - digitsStart));
+    return toLong(digits.getRaw());
+}
+
+// ======================================================= Paths =======================================================
+
+/**
+ * Builder for the query string of a request. Empty values are left out
+ */
+type Query struct {
+    String text
+}
+
+p Query.add(string key, const String& value) {
+    if value.isEmpty() { return; }
+    this.text += this.text.isEmpty() ? "?" : "&";
+    this.text += key;
+    this.text += "=";
+    this.text += urlEncode(value);
+}
+
+p Query.add(string key, string value) {
+    this.add(key, String(value));
+}
+
+p Query.addLong(string key, long value) {
+    if value > 0l { this.add(key, toString(value)); }
+}
+
+/**
+ * Builds the path to a repository, with both parts encoded
+ */
+f<String> repoPath(string owner, string repo) {
+    return String("/repos/") + urlEncode(String(owner)) + "/" + urlEncode(String(repo));
+}
+
+/**
+ * Encodes a path that may consist of several segments, like a file path or a branch name with slashes
+ */
+f<String> encodePath(string path) {
+    result = String();
+    const Vector<String> segments = split(String(path), '/');
+    for unsigned long i = 0l; i < segments.getSize(); i++ {
+        if i > 0l { result += "/"; }
+        result += urlEncode(segments.get(i));
+    }
+}
+
+/**
+ * Appends the pagination parameters to a query
+ */
+p GitHubClient.addPage(Query& query, long page) {
+    query.addLong("per_page", this.perPage);
+    query.addLong("page", page);
+}
+
+// ======================================================== Users ======================================================
+
+/**
+ * Returns the user the token belongs to
+ *
+ * @return Authenticated user
+ */
+public f<Result<User>> GitHubClient.getAuthenticatedUser() {
+    return this.requestObject<User>(HttpMethod::GET, String("/user"), String());
+}
+
+/**
+ * Returns a user
+ *
+ * @param login Login of the user
+ * @return The user
+ */
+public f<Result<User>> GitHubClient.getUser(string login) {
+    const String path = String("/users/") + urlEncode(String(login));
+    return this.requestObject<User>(HttpMethod::GET, path, String());
+}
+
+/**
+ * Returns an organization. Organizations are decoded as users, with accountType "Organization"
+ *
+ * @param org Login of the organization
+ * @return The organization
+ */
+public f<Result<User>> GitHubClient.getOrganization(string org) {
+    const String path = String("/orgs/") + urlEncode(String(org));
+    return this.requestObject<User>(HttpMethod::GET, path, String());
+}
+
+/**
+ * Returns the quota of the token for the core API. Unlike other requests, this one does not count against the quota
+ *
+ * @return Quota of the core API
+ */
+public f<Result<RateLimit>> GitHubClient.getRateLimit() {
+    Result<JsonValue*> json = this.requestJson(HttpMethod::GET, String("/rate_limit"), String());
+    if json.isErr() { return err<RateLimit>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    JsonReader reader = JsonReader(root);
+    JsonReader resources = reader.child("resources");
+    RateLimit limit;
+    limit.loadJson(resources.get("core"));
+    deleteJsonValue(root);
+    return ok(limit);
+}
+
+// ==================================================== Repositories ===================================================
+
+/**
+ * Returns a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return The repository
+ */
+public f<Result<Repository>> GitHubClient.getRepository(string owner, string repo) {
+    return this.requestObject<Repository>(HttpMethod::GET, repoPath(owner, repo), String());
+}
+
+/**
+ * Lists the repositories of the authenticated user, including those of their organizations and collaborations
+ *
+ * @param filter Filter and sort order
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listMyRepositories(const RepositoryFilter& filter, long page = 1l) {
+    Query query;
+    query.add("type", filter.repoType);
+    query.add("visibility", filter.visibility);
+    query.add("sort", filter.sort);
+    query.add("direction", filter.direction);
+    this.addPage(query, page);
+    return this.requestList<Repository>(HttpMethod::GET, String("/user/repos") + query.text, String());
+}
+
+/**
+ * Lists the repositories of the authenticated user
+ *
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listMyRepositories(long page = 1l) {
+    const RepositoryFilter filter;
+    return this.listMyRepositories(filter, page);
+}
+
+/**
+ * Lists the public repositories of a user
+ *
+ * @param login Login of the user
+ * @param filter Filter and sort order
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listUserRepositories(string login, const RepositoryFilter& filter, long page = 1l) {
+    Query query;
+    query.add("type", filter.repoType);
+    query.add("sort", filter.sort);
+    query.add("direction", filter.direction);
+    this.addPage(query, page);
+    const String path = String("/users/") + urlEncode(String(login)) + "/repos" + query.text;
+    return this.requestList<Repository>(HttpMethod::GET, path, String());
+}
+
+/**
+ * Lists the public repositories of a user
+ *
+ * @param login Login of the user
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listUserRepositories(string login, long page = 1l) {
+    const RepositoryFilter filter;
+    return this.listUserRepositories(login, filter, page);
+}
+
+/**
+ * Lists the repositories of an organization
+ *
+ * @param org Login of the organization
+ * @param filter Filter and sort order
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listOrgRepositories(string org, const RepositoryFilter& filter, long page = 1l) {
+    Query query;
+    query.add("type", filter.repoType);
+    query.add("sort", filter.sort);
+    query.add("direction", filter.direction);
+    this.addPage(query, page);
+    const String path = String("/orgs/") + urlEncode(String(org)) + "/repos" + query.text;
+    return this.requestList<Repository>(HttpMethod::GET, path, String());
+}
+
+/**
+ * Lists the repositories of an organization
+ *
+ * @param org Login of the organization
+ * @param page Page to return, starting at 1
+ * @return The repositories
+ */
+public f<Result<Vector<Repository>>> GitHubClient.listOrgRepositories(string org, long page = 1l) {
+    const RepositoryFilter filter;
+    return this.listOrgRepositories(org, filter, page);
+}
+
+/**
+ * Creates a repository for the authenticated user, or for an organization
+ *
+ * @param settings Settings of the repository
+ * @param org Organization to create the repository in, empty for the authenticated user
+ * @return The new repository
+ */
+public f<Result<Repository>> GitHubClient.createRepository(const NewRepository& settings, string org = "") {
+    JsonBuilder body;
+    body.putString("name", settings.name);
+    body.putStringIfSet("description", settings.description);
+    body.putStringIfSet("homepage", settings.homepage);
+    body.putBool("private", settings.isPrivate);
+    body.putBool("auto_init", settings.autoInit);
+    body.putStringIfSet("gitignore_template", settings.gitignoreTemplate);
+    body.putStringIfSet("license_template", settings.licenseTemplate);
+    const String orgName = String(org);
+    const String path = orgName.isEmpty() ? String("/user/repos") : String("/orgs/") + urlEncode(orgName) + "/repos";
+    return this.requestObject<Repository>(HttpMethod::POST, path, body.build());
+}
+
+/**
+ * Deletes a repository. Requires the delete_repo scope
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.deleteRepository(string owner, string repo) {
+    return this.requestNoContent(HttpMethod::DELETE, repoPath(owner, repo), String());
+}
+
+/**
+ * Forks a repository into the account of the authenticated user, or into an organization. GitHub creates the fork
+ * asynchronously, so its contents may take a moment to show up
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param org Organization to fork into, empty for the authenticated user
+ * @return The fork
+ */
+public f<Result<Repository>> GitHubClient.forkRepository(string owner, string repo, string org = "") {
+    JsonBuilder body;
+    body.putStringIfSet("organization", String(org));
+    return this.requestObject<Repository>(HttpMethod::POST, repoPath(owner, repo) + "/forks", body.build());
+}
+
+/**
+ * Stars a repository for the authenticated user
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.starRepository(string owner, string repo) {
+    const String path = String("/user/starred/") + urlEncode(String(owner)) + "/" + urlEncode(String(repo));
+    return this.requestNoContent(HttpMethod::PUT, path, String());
+}
+
+/**
+ * Removes the star of the authenticated user from a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.unstarRepository(string owner, string repo) {
+    const String path = String("/user/starred/") + urlEncode(String(owner)) + "/" + urlEncode(String(repo));
+    return this.requestNoContent(HttpMethod::DELETE, path, String());
+}
+
+/**
+ * Lists the topics of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return The topics
+ */
+public f<Result<Vector<String>>> GitHubClient.listTopics(string owner, string repo) {
+    Result<JsonValue*> json = this.requestJson(HttpMethod::GET, repoPath(owner, repo) + "/topics", String());
+    if json.isErr() { return err<Vector<String>>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    Vector<String> topics;
+    JsonReader reader = JsonReader(root);
+    reader.readStringArray("names", topics);
+    deleteJsonValue(root);
+    return ok(topics);
+}
+
+/**
+ * Lists the contributors of a repository, ordered by their number of commits
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The contributors
+ */
+public f<Result<Vector<Contributor>>> GitHubClient.listContributors(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Contributor>(HttpMethod::GET, repoPath(owner, repo) + "/contributors" + query.text, String());
+}
+
+/**
+ * Lists the branches of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The branches
+ */
+public f<Result<Vector<Branch>>> GitHubClient.listBranches(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Branch>(HttpMethod::GET, repoPath(owner, repo) + "/branches" + query.text, String());
+}
+
+/**
+ * Returns a branch
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param branch Name of the branch
+ * @return The branch
+ */
+public f<Result<Branch>> GitHubClient.getBranch(string owner, string repo, string branch) {
+    return this.requestObject<Branch>(HttpMethod::GET, repoPath(owner, repo) + "/branches/" + encodePath(branch), String());
+}
+
+/**
+ * Lists the tags of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The tags
+ */
+public f<Result<Vector<Tag>>> GitHubClient.listTags(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Tag>(HttpMethod::GET, repoPath(owner, repo) + "/tags" + query.text, String());
+}
+
+// ======================================================= Commits =====================================================
+
+/**
+ * Lists commits of a repository, newest first
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param filter Branch, path, author and time range to list commits of
+ * @param page Page to return, starting at 1
+ * @return The commits, without stats and files
+ */
+public f<Result<Vector<Commit>>> GitHubClient.listCommits(string owner, string repo, const CommitFilter& filter, long page = 1l) {
+    Query query;
+    query.add("sha", filter.sha);
+    query.add("path", filter.path);
+    query.add("author", filter.author);
+    query.add("since", filter.since);
+    query.add("until", filter.until);
+    this.addPage(query, page);
+    return this.requestList<Commit>(HttpMethod::GET, repoPath(owner, repo) + "/commits" + query.text, String());
+}
+
+/**
+ * Lists the commits of the default branch of a repository, newest first
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The commits, without stats and files
+ */
+public f<Result<Vector<Commit>>> GitHubClient.listCommits(string owner, string repo, long page = 1l) {
+    const CommitFilter filter;
+    return this.listCommits(owner, repo, filter, page);
+}
+
+/**
+ * Returns a commit, including its stats and changed files
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param ref Sha, branch or tag
+ * @return The commit
+ */
+public f<Result<Commit>> GitHubClient.getCommit(string owner, string repo, string ref) {
+    return this.requestObject<Commit>(HttpMethod::GET, repoPath(owner, repo) + "/commits/" + encodePath(ref), String());
+}
+
+// ====================================================== Contents =====================================================
+
+/**
+ * Returns a file of a repository, including its decoded content
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param path Path of the file
+ * @param ref Branch, tag or sha to read from, the default branch if empty
+ * @return The file
+ */
+public f<Result<Content>> GitHubClient.getFile(string owner, string repo, string path, string ref = "") {
+    Query query;
+    query.add("ref", ref);
+    return this.fetchFile(repoPath(owner, repo) + "/contents/" + encodePath(path) + query.text);
+}
+
+/**
+ * Returns the README of a repository, including its decoded content
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param ref Branch, tag or sha to read from, the default branch if empty
+ * @return The README file
+ */
+public f<Result<Content>> GitHubClient.getReadme(string owner, string repo, string ref = "") {
+    Query query;
+    query.add("ref", ref);
+    return this.fetchFile(repoPath(owner, repo) + "/readme" + query.text);
+}
+
+/**
+ * Fetches a file through the contents API and decodes its Base64 payload
+ */
+f<Result<Content>> GitHubClient.fetchFile(const String& path) {
+    Result<JsonValue*> json = this.requestJson(HttpMethod::GET, path, String());
+    if json.isErr() { return err<Content>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    if !root.isObject() {
+        // Directories are answered with an array of their entries
+        deleteJsonValue(root);
+        this.lastError.message = String("The path is a directory, not a file");
+        return err<Content>("The path is a directory, not a file");
+    }
+    Content file;
+    file.loadJson(root);
+    JsonReader reader = JsonReader(root);
+    String encoding;
+    String encoded;
+    reader.readString("encoding", encoding);
+    reader.readString("content", encoded);
+    deleteJsonValue(root);
+    if encoding == "base64" {
+        Result<String> decoded = decodeBase64(encoded);
+        if decoded.isErr() { return this.failDecoding<Content>(); }
+        file.content = decoded.unwrap();
+    } else if encoding == "none" {
+        // Files above 1 MB come without content and have to be fetched from the download URL
+        this.lastError.message = String("The file is too large for the contents API, use its downloadUrl instead");
+        return err<Content>("The file is too large for the contents API");
+    }
+    return ok(file);
+}
+
+/**
+ * Lists the entries of a directory of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param path Path of the directory, empty for the root
+ * @param ref Branch, tag or sha to read from, the default branch if empty
+ * @return The entries, without content
+ */
+public f<Result<Vector<Content>>> GitHubClient.listDirectory(string owner, string repo, string path = "", string ref = "") {
+    Query query;
+    query.add("ref", ref);
+    const String fullPath = repoPath(owner, repo) + "/contents/" + encodePath(path) + query.text;
+    return this.requestList<Content>(HttpMethod::GET, fullPath, String());
+}
+
+/**
+ * Creates a file, or replaces it if `change.sha` names its current blob, in a new commit
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param path Path of the file
+ * @param change Commit message, content and target of the change
+ * @return Shas of the new blob and the commit
+ */
+public f<Result<FileCommit>> GitHubClient.createOrUpdateFile(string owner, string repo, string path, const FileChange& change) {
+    JsonBuilder body;
+    body.putString("message", change.message);
+    body.putString("content", encodeBase64(change.content));
+    this.putFileChangeTarget(body, change);
+    const String fullPath = repoPath(owner, repo) + "/contents/" + encodePath(path);
+    return this.requestObject<FileCommit>(HttpMethod::PUT, fullPath, body.build());
+}
+
+/**
+ * Deletes a file in a new commit. `change.sha` has to name the current blob of the file
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param path Path of the file
+ * @param change Commit message, blob sha and target of the change
+ * @return Sha of the commit
+ */
+public f<Result<FileCommit>> GitHubClient.deleteFile(string owner, string repo, string path, const FileChange& change) {
+    JsonBuilder body;
+    body.putString("message", change.message);
+    this.putFileChangeTarget(body, change);
+    const String fullPath = repoPath(owner, repo) + "/contents/" + encodePath(path);
+    return this.requestObject<FileCommit>(HttpMethod::DELETE, fullPath, body.build());
+}
+
+p GitHubClient.putFileChangeTarget(JsonBuilder& body, const FileChange& change) {
+    body.putStringIfSet("sha", change.sha);
+    body.putStringIfSet("branch", change.branch);
+    if !change.committerName.isEmpty() && !change.committerEmail.isEmpty() {
+        body.putPerson("committer", change.committerName, change.committerEmail);
+    }
+}
+
+// ======================================================= Issues ======================================================
+
+/**
+ * Lists the issues of a repository. Pull requests are included as well, see `Issue.isPullRequest`
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param filter State, labels, people and sort order
+ * @param page Page to return, starting at 1
+ * @return The issues
+ */
+public f<Result<Vector<Issue>>> GitHubClient.listIssues(string owner, string repo, const IssueFilter& filter, long page = 1l) {
+    Query query;
+    query.add("state", filter.state);
+    query.add("labels", filter.labels);
+    query.add("assignee", filter.assignee);
+    query.add("creator", filter.creator);
+    query.add("mentioned", filter.mentioned);
+    query.add("milestone", filter.milestone);
+    query.add("sort", filter.sort);
+    query.add("direction", filter.direction);
+    query.add("since", filter.since);
+    this.addPage(query, page);
+    return this.requestList<Issue>(HttpMethod::GET, repoPath(owner, repo) + "/issues" + query.text, String());
+}
+
+/**
+ * Lists the open issues of a repository. Pull requests are included as well, see `Issue.isPullRequest`
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The issues
+ */
+public f<Result<Vector<Issue>>> GitHubClient.listIssues(string owner, string repo, long page = 1l) {
+    const IssueFilter filter;
+    return this.listIssues(owner, repo, filter, page);
+}
+
+/**
+ * Returns an issue
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue
+ * @return The issue
+ */
+public f<Result<Issue>> GitHubClient.getIssue(string owner, string repo, long number) {
+    return this.requestObject<Issue>(HttpMethod::GET, issuePath(owner, repo, number), String());
+}
+
+/**
+ * Opens an issue
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param issue Title and further fields of the issue
+ * @return The new issue
+ */
+public f<Result<Issue>> GitHubClient.createIssue(string owner, string repo, const IssueChange& issue) {
+    JsonBuilder body;
+    body.putString("title", issue.title);
+    putIssueFields(body, issue);
+    return this.requestObject<Issue>(HttpMethod::POST, repoPath(owner, repo) + "/issues", body.build());
+}
+
+/**
+ * Opens an issue with the given title and body
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param title Title of the issue
+ * @param text Body of the issue, in Markdown
+ * @return The new issue
+ */
+public f<Result<Issue>> GitHubClient.createIssue(string owner, string repo, string title, string text = "") {
+    IssueChange issue;
+    issue.title = String(title);
+    issue.body = String(text);
+    return this.createIssue(owner, repo, issue);
+}
+
+/**
+ * Updates an issue. Only the fields that are set in the change are modified
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue
+ * @param change Fields to update
+ * @return The updated issue
+ */
+public f<Result<Issue>> GitHubClient.updateIssue(string owner, string repo, long number, const IssueChange& change) {
+    JsonBuilder body;
+    body.putStringIfSet("title", change.title);
+    body.putStringIfSet("state", change.state);
+    body.putStringIfSet("state_reason", change.stateReason);
+    putIssueFields(body, change);
+    return this.requestObject<Issue>(HttpMethod::PATCH, issuePath(owner, repo, number), body.build());
+}
+
+/**
+ * Closes an issue
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue
+ * @param reason "completed" or "not_planned"
+ * @return The closed issue
+ */
+public f<Result<Issue>> GitHubClient.closeIssue(string owner, string repo, long number, string reason = "completed") {
+    IssueChange change;
+    change.state = String("closed");
+    change.stateReason = String(reason);
+    return this.updateIssue(owner, repo, number, change);
+}
+
+/**
+ * Reopens an issue
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue
+ * @return The reopened issue
+ */
+public f<Result<Issue>> GitHubClient.reopenIssue(string owner, string repo, long number) {
+    IssueChange change;
+    change.state = String("open");
+    return this.updateIssue(owner, repo, number, change);
+}
+
+/**
+ * Lists the comments on an issue or on the conversation of a pull request, oldest first
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue or pull request
+ * @param page Page to return, starting at 1
+ * @return The comments
+ */
+public f<Result<Vector<Comment>>> GitHubClient.listComments(string owner, string repo, long number, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Comment>(HttpMethod::GET, issuePath(owner, repo, number) + "/comments" + query.text, String());
+}
+
+/**
+ * Comments on an issue or on the conversation of a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue or pull request
+ * @param text Comment, in Markdown
+ * @return The new comment
+ */
+public f<Result<Comment>> GitHubClient.createComment(string owner, string repo, long number, string text) {
+    JsonBuilder body;
+    body.putString("body", String(text));
+    return this.requestObject<Comment>(HttpMethod::POST, issuePath(owner, repo, number) + "/comments", body.build());
+}
+
+/**
+ * Replaces the text of a comment
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param commentId Id of the comment
+ * @param text New comment, in Markdown
+ * @return The updated comment
+ */
+public f<Result<Comment>> GitHubClient.updateComment(string owner, string repo, long commentId, string text) {
+    JsonBuilder body;
+    body.putString("body", String(text));
+    return this.requestObject<Comment>(HttpMethod::PATCH, commentPath(owner, repo, commentId), body.build());
+}
+
+/**
+ * Deletes a comment
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param commentId Id of the comment
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.deleteComment(string owner, string repo, long commentId) {
+    return this.requestNoContent(HttpMethod::DELETE, commentPath(owner, repo, commentId), String());
+}
+
+/**
+ * Lists the labels defined in a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The labels
+ */
+public f<Result<Vector<Label>>> GitHubClient.listLabels(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Label>(HttpMethod::GET, repoPath(owner, repo) + "/labels" + query.text, String());
+}
+
+/**
+ * Defines a new label in a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param name Name of the label
+ * @param color Hex color without the leading '#', e.g. "d73a4a"
+ * @param description Short description
+ * @return The new label
+ */
+public f<Result<Label>> GitHubClient.createLabel(string owner, string repo, string name, string color, string description = "") {
+    JsonBuilder body;
+    body.putString("name", String(name));
+    body.putString("color", String(color));
+    body.putStringIfSet("description", String(description));
+    return this.requestObject<Label>(HttpMethod::POST, repoPath(owner, repo) + "/labels", body.build());
+}
+
+/**
+ * Adds labels to an issue or pull request. Labels that do not exist yet are created
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue or pull request
+ * @param labels Names of the labels
+ * @return All labels of the issue afterwards
+ */
+public f<Result<Vector<Label>>> GitHubClient.addLabels(string owner, string repo, long number, const Vector<String>& labels) {
+    JsonBuilder body;
+    body.putStringArray("labels", labels);
+    return this.requestList<Label>(HttpMethod::POST, issuePath(owner, repo, number) + "/labels", body.build());
+}
+
+/**
+ * Removes a label from an issue or pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the issue or pull request
+ * @param label Name of the label
+ * @return The remaining labels of the issue
+ */
+public f<Result<Vector<Label>>> GitHubClient.removeLabel(string owner, string repo, long number, string label) {
+    const String path = issuePath(owner, repo, number) + "/labels/" + urlEncode(String(label));
+    return this.requestList<Label>(HttpMethod::DELETE, path, String());
+}
+
+f<String> issuePath(string owner, string repo, long number) {
+    return repoPath(owner, repo) + "/issues/" + toString(number);
+}
+
+f<String> commentPath(string owner, string repo, long commentId) {
+    return repoPath(owner, repo) + "/issues/comments/" + toString(commentId);
+}
+
+/**
+ * Adds the fields that creating and updating an issue have in common
+ */
+p putIssueFields(JsonBuilder& body, const IssueChange& issue) {
+    body.putStringIfSet("body", issue.body);
+    if !issue.labels.isEmpty() { body.putStringArray("labels", issue.labels); }
+    if !issue.assignees.isEmpty() { body.putStringArray("assignees", issue.assignees); }
+    if issue.milestone > 0l { body.putLong("milestone", issue.milestone); }
+}
+
+// ==================================================== Pull requests ==================================================
+
+/**
+ * Lists the pull requests of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param filter State, branches and sort order
+ * @param page Page to return, starting at 1
+ * @return The pull requests, without counts and mergeability
+ */
+public f<Result<Vector<PullRequest>>> GitHubClient.listPullRequests(string owner, string repo, const PullRequestFilter& filter, long page = 1l) {
+    Query query;
+    query.add("state", filter.state);
+    query.add("head", filter.head);
+    query.add("base", filter.base);
+    query.add("sort", filter.sort);
+    query.add("direction", filter.direction);
+    this.addPage(query, page);
+    return this.requestList<PullRequest>(HttpMethod::GET, repoPath(owner, repo) + "/pulls" + query.text, String());
+}
+
+/**
+ * Lists the open pull requests of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The pull requests, without counts and mergeability
+ */
+public f<Result<Vector<PullRequest>>> GitHubClient.listPullRequests(string owner, string repo, long page = 1l) {
+    const PullRequestFilter filter;
+    return this.listPullRequests(owner, repo, filter, page);
+}
+
+/**
+ * Returns a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @return The pull request
+ */
+public f<Result<PullRequest>> GitHubClient.getPullRequest(string owner, string repo, long number) {
+    return this.requestObject<PullRequest>(HttpMethod::GET, pullPath(owner, repo, number), String());
+}
+
+/**
+ * Opens a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param settings Title, branches and further settings
+ * @return The new pull request
+ */
+public f<Result<PullRequest>> GitHubClient.createPullRequest(string owner, string repo, const NewPullRequest& settings) {
+    JsonBuilder body;
+    body.putString("title", settings.title);
+    body.putString("head", settings.head);
+    body.putString("base", settings.base);
+    body.putStringIfSet("body", settings.body);
+    body.putBool("draft", settings.isDraft);
+    body.putBool("maintainer_can_modify", settings.maintainerCanModify);
+    return this.requestObject<PullRequest>(HttpMethod::POST, repoPath(owner, repo) + "/pulls", body.build());
+}
+
+/**
+ * Updates a pull request. Only the fields that are set in the change are modified
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param change Fields to update
+ * @return The updated pull request
+ */
+public f<Result<PullRequest>> GitHubClient.updatePullRequest(string owner, string repo, long number, const PullRequestChange& change) {
+    JsonBuilder body;
+    body.putStringIfSet("title", change.title);
+    body.putStringIfSet("body", change.body);
+    body.putStringIfSet("state", change.state);
+    body.putStringIfSet("base", change.base);
+    return this.requestObject<PullRequest>(HttpMethod::PATCH, pullPath(owner, repo, number), body.build());
+}
+
+/**
+ * Merges a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param options Merge method and commit message
+ * @return Outcome of the merge. GitHub answers 405 if the pull request cannot be merged and 409 if the head moved
+ */
+public f<Result<MergeResult>> GitHubClient.mergePullRequest(string owner, string repo, long number, const MergeOptions& options) {
+    JsonBuilder body;
+    body.putStringIfSet("merge_method", options.method);
+    body.putStringIfSet("commit_title", options.commitTitle);
+    body.putStringIfSet("commit_message", options.commitMessage);
+    body.putStringIfSet("sha", options.sha);
+    return this.requestObject<MergeResult>(HttpMethod::PUT, pullPath(owner, repo, number) + "/merge", body.build());
+}
+
+/**
+ * Merges a pull request with the given method and the default commit message
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param method "merge", "squash" or "rebase"
+ * @return Outcome of the merge
+ */
+public f<Result<MergeResult>> GitHubClient.mergePullRequest(string owner, string repo, long number, string method = "merge") {
+    MergeOptions options;
+    options.method = String(method);
+    return this.mergePullRequest(owner, repo, number, options);
+}
+
+/**
+ * Lists the files a pull request changes
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param page Page to return, starting at 1
+ * @return The changed files
+ */
+public f<Result<Vector<ChangedFile>>> GitHubClient.listPullRequestFiles(string owner, string repo, long number, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<ChangedFile>(HttpMethod::GET, pullPath(owner, repo, number) + "/files" + query.text, String());
+}
+
+/**
+ * Lists the commits of a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param page Page to return, starting at 1
+ * @return The commits, without stats and files
+ */
+public f<Result<Vector<Commit>>> GitHubClient.listPullRequestCommits(string owner, string repo, long number, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Commit>(HttpMethod::GET, pullPath(owner, repo, number) + "/commits" + query.text, String());
+}
+
+/**
+ * Lists the reviews of a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param page Page to return, starting at 1
+ * @return The reviews
+ */
+public f<Result<Vector<Review>>> GitHubClient.listReviews(string owner, string repo, long number, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Review>(HttpMethod::GET, pullPath(owner, repo, number) + "/reviews" + query.text, String());
+}
+
+/**
+ * Submits a review of a pull request
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param event "APPROVE", "REQUEST_CHANGES" or "COMMENT"
+ * @param text Review comment, in Markdown. Required for REQUEST_CHANGES and COMMENT
+ * @return The review
+ */
+public f<Result<Review>> GitHubClient.createReview(string owner, string repo, long number, string event, string text = "") {
+    JsonBuilder body;
+    body.putString("event", String(event));
+    body.putStringIfSet("body", String(text));
+    return this.requestObject<Review>(HttpMethod::POST, pullPath(owner, repo, number) + "/reviews", body.build());
+}
+
+/**
+ * Requests reviews of a pull request from users
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param number Number of the pull request
+ * @param reviewers Logins of the reviewers
+ * @return The updated pull request
+ */
+public f<Result<PullRequest>> GitHubClient.requestReviewers(string owner, string repo, long number, const Vector<String>& reviewers) {
+    JsonBuilder body;
+    body.putStringArray("reviewers", reviewers);
+    return this.requestObject<PullRequest>(HttpMethod::POST, pullPath(owner, repo, number) + "/requested_reviewers", body.build());
+}
+
+f<String> pullPath(string owner, string repo, long number) {
+    return repoPath(owner, repo) + "/pulls/" + toString(number);
+}
+
+// ====================================================== Releases =====================================================
+
+/**
+ * Lists the releases of a repository, newest first. Drafts are only included for users with push access
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The releases
+ */
+public f<Result<Vector<Release>>> GitHubClient.listReleases(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    return this.requestList<Release>(HttpMethod::GET, repoPath(owner, repo) + "/releases" + query.text, String());
+}
+
+/**
+ * Returns a release
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param releaseId Id of the release
+ * @return The release
+ */
+public f<Result<Release>> GitHubClient.getRelease(string owner, string repo, long releaseId) {
+    return this.requestObject<Release>(HttpMethod::GET, releasePath(owner, repo, releaseId), String());
+}
+
+/**
+ * Returns the latest published full release, i.e. the newest one that is neither a draft nor a prerelease
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @return The release, or a 404 error if there is none
+ */
+public f<Result<Release>> GitHubClient.getLatestRelease(string owner, string repo) {
+    return this.requestObject<Release>(HttpMethod::GET, repoPath(owner, repo) + "/releases/latest", String());
+}
+
+/**
+ * Returns the release of a tag
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param tag Name of the tag
+ * @return The release
+ */
+public f<Result<Release>> GitHubClient.getReleaseByTag(string owner, string repo, string tag) {
+    return this.requestObject<Release>(HttpMethod::GET, repoPath(owner, repo) + "/releases/tags/" + encodePath(tag), String());
+}
+
+/**
+ * Creates a release. The tag is created as well, if it does not exist yet
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param settings Tag, name, notes and flags of the release
+ * @return The new release
+ */
+public f<Result<Release>> GitHubClient.createRelease(string owner, string repo, const NewRelease& settings) {
+    JsonBuilder body;
+    body.putString("tag_name", settings.tagName);
+    body.putStringIfSet("target_commitish", settings.targetCommitish);
+    body.putStringIfSet("name", settings.name);
+    body.putStringIfSet("body", settings.body);
+    body.putBool("draft", settings.isDraft);
+    body.putBool("prerelease", settings.isPrerelease);
+    body.putBool("generate_release_notes", settings.generateReleaseNotes);
+    return this.requestObject<Release>(HttpMethod::POST, repoPath(owner, repo) + "/releases", body.build());
+}
+
+/**
+ * Deletes a release. The tag stays
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param releaseId Id of the release
+ * @return true on success
+ */
+public f<Result<bool>> GitHubClient.deleteRelease(string owner, string repo, long releaseId) {
+    return this.requestNoContent(HttpMethod::DELETE, releasePath(owner, repo, releaseId), String());
+}
+
+f<String> releasePath(string owner, string repo, long releaseId) {
+    return repoPath(owner, repo) + "/releases/" + toString(releaseId);
+}
+
+// ====================================================== Actions ======================================================
+
+/**
+ * Lists the GitHub Actions workflows of a repository
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The workflows and their total count
+ */
+public f<Result<CountedList<Workflow>>> GitHubClient.listWorkflows(string owner, string repo, long page = 1l) {
+    Query query;
+    this.addPage(query, page);
+    Result<JsonValue*> json = this.requestJson(HttpMethod::GET, repoPath(owner, repo) + "/actions/workflows" + query.text, String());
+    if json.isErr() { return err<CountedList<Workflow>>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    CountedList<Workflow> workflows;
+    workflows.loadJson(root, "workflows");
+    deleteJsonValue(root);
+    return ok(workflows);
+}
+
+/**
+ * Lists workflow runs of a repository, newest first
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param filter Workflow, branch, event, status and actor to list runs of
+ * @param page Page to return, starting at 1
+ * @return The runs and their total count
+ */
+public f<Result<CountedList<WorkflowRun>>> GitHubClient.listWorkflowRuns(string owner, string repo, const WorkflowRunFilter& filter, long page = 1l) {
+    Query query;
+    query.add("branch", filter.branch);
+    query.add("event", filter.event);
+    query.add("status", filter.status);
+    query.add("actor", filter.actor);
+    this.addPage(query, page);
+    String path = repoPath(owner, repo) + "/actions";
+    if !filter.workflow.isEmpty() { path += String("/workflows/") + urlEncode(filter.workflow); }
+    path += "/runs";
+    path += query.text;
+    Result<JsonValue*> json = this.requestJson(HttpMethod::GET, path, String());
+    if json.isErr() { return err<CountedList<WorkflowRun>>(json.getErr()); }
+    JsonValue* root = json.unwrap();
+    CountedList<WorkflowRun> runs;
+    runs.loadJson(root, "workflow_runs");
+    deleteJsonValue(root);
+    return ok(runs);
+}
+
+/**
+ * Lists the workflow runs of a repository, newest first
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param page Page to return, starting at 1
+ * @return The runs and their total count
+ */
+public f<Result<CountedList<WorkflowRun>>> GitHubClient.listWorkflowRuns(string owner, string repo, long page = 1l) {
+    const WorkflowRunFilter filter;
+    return this.listWorkflowRuns(owner, repo, filter, page);
+}
+
+/**
+ * Returns a workflow run
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param runId Id of the run
+ * @return The run
+ */
+public f<Result<WorkflowRun>> GitHubClient.getWorkflowRun(string owner, string repo, long runId) {
+    return this.requestObject<WorkflowRun>(HttpMethod::GET, runPath(owner, repo, runId), String());
+}
+
+/**
+ * Triggers a workflow that declares the workflow_dispatch event
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param workflow Workflow id or file name, e.g. "release.yml"
+ * @param dispatch Ref and inputs to run the workflow with
+ * @return true once GitHub accepted the trigger. The run itself starts asynchronously
+ */
+public f<Result<bool>> GitHubClient.dispatchWorkflow(string owner, string repo, string workflow, const WorkflowDispatch& dispatch) {
+    JsonBuilder body;
+    body.putString("ref", dispatch.ref);
+    if !dispatch.inputNames.isEmpty() { body.putStringMap("inputs", dispatch.inputNames, dispatch.inputValues); }
+    const String path = repoPath(owner, repo) + "/actions/workflows/" + urlEncode(String(workflow)) + "/dispatches";
+    return this.requestNoContent(HttpMethod::POST, path, body.build());
+}
+
+/**
+ * Cancels a workflow run
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param runId Id of the run
+ * @return true once GitHub accepted the cancellation
+ */
+public f<Result<bool>> GitHubClient.cancelWorkflowRun(string owner, string repo, long runId) {
+    return this.requestNoContent(HttpMethod::POST, runPath(owner, repo, runId) + "/cancel", String());
+}
+
+/**
+ * Re-runs a workflow run
+ *
+ * @param owner Owner of the repository
+ * @param repo Name of the repository
+ * @param runId Id of the run
+ * @param onlyFailedJobs Only re-run the jobs that failed
+ * @return true once GitHub accepted the re-run
+ */
+public f<Result<bool>> GitHubClient.rerunWorkflowRun(string owner, string repo, long runId, bool onlyFailedJobs = false) {
+    const String path = runPath(owner, repo, runId) + (onlyFailedJobs ? "/rerun-failed-jobs" : "/rerun");
+    return this.requestNoContent(HttpMethod::POST, path, String());
+}
+
+f<String> runPath(string owner, string repo, long runId) {
+    return repoPath(owner, repo) + "/actions/runs/" + toString(runId);
+}
+
+// ======================================================= Search ======================================================
+
+/**
+ * Searches repositories
+ *
+ * @param query Search query, e.g. "language:spice stars:>10"
+ * @param options Sort order
+ * @param page Page to return, starting at 1
+ * @return The matching repositories and their total count
+ */
+public f<Result<SearchResult<Repository>>> GitHubClient.searchRepositories(string query, const SearchOptions& options, long page = 1l) {
+    SearchResult<Repository> found;
+    Result<bool> loaded = this.requestInto<SearchResult<Repository>>(HttpMethod::GET, this.searchPath("repositories", query, options, page), String(), found);
+    if loaded.isErr() { return err<SearchResult<Repository>>(loaded.getErr()); }
+    return ok(found);
+}
+
+/**
+ * Searches repositories, best match first
+ *
+ * @param query Search query, e.g. "language:spice stars:>10"
+ * @param page Page to return, starting at 1
+ * @return The matching repositories and their total count
+ */
+public f<Result<SearchResult<Repository>>> GitHubClient.searchRepositories(string query, long page = 1l) {
+    const SearchOptions options;
+    return this.searchRepositories(query, options, page);
+}
+
+/**
+ * Searches issues and pull requests
+ *
+ * @param query Search query, e.g. "repo:spicelang/spice is:issue is:open label:bug"
+ * @param options Sort order
+ * @param page Page to return, starting at 1
+ * @return The matching issues and their total count
+ */
+public f<Result<SearchResult<Issue>>> GitHubClient.searchIssues(string query, const SearchOptions& options, long page = 1l) {
+    SearchResult<Issue> found;
+    Result<bool> loaded = this.requestInto<SearchResult<Issue>>(HttpMethod::GET, this.searchPath("issues", query, options, page), String(), found);
+    if loaded.isErr() { return err<SearchResult<Issue>>(loaded.getErr()); }
+    return ok(found);
+}
+
+/**
+ * Searches issues and pull requests, best match first
+ *
+ * @param query Search query, e.g. "repo:spicelang/spice is:issue is:open label:bug"
+ * @param page Page to return, starting at 1
+ * @return The matching issues and their total count
+ */
+public f<Result<SearchResult<Issue>>> GitHubClient.searchIssues(string query, long page = 1l) {
+    const SearchOptions options;
+    return this.searchIssues(query, options, page);
+}
+
+/**
+ * Searches users and organizations
+ *
+ * @param query Search query, e.g. "location:germany language:spice"
+ * @param options Sort order
+ * @param page Page to return, starting at 1
+ * @return The matching users and their total count. Only the basic fields of the users are filled
+ */
+public f<Result<SearchResult<User>>> GitHubClient.searchUsers(string query, const SearchOptions& options, long page = 1l) {
+    SearchResult<User> found;
+    Result<bool> loaded = this.requestInto<SearchResult<User>>(HttpMethod::GET, this.searchPath("users", query, options, page), String(), found);
+    if loaded.isErr() { return err<SearchResult<User>>(loaded.getErr()); }
+    return ok(found);
+}
+
+/**
+ * Searches users and organizations, best match first
+ *
+ * @param query Search query, e.g. "location:germany language:spice"
+ * @param page Page to return, starting at 1
+ * @return The matching users and their total count. Only the basic fields of the users are filled
+ */
+public f<Result<SearchResult<User>>> GitHubClient.searchUsers(string query, long page = 1l) {
+    const SearchOptions options;
+    return this.searchUsers(query, options, page);
+}
+
+f<String> GitHubClient.searchPath(string kind, string text, const SearchOptions& options, long page) {
+    Query query;
+    query.add("q", text);
+    query.add("sort", options.sort);
+    query.add("order", options.order);
+    this.addPage(query, page);
+    return String("/search/") + kind + query.text;
+}
+
+// ======================================================== Tests ======================================================
+
+#[test]
+f<bool> testPageLinks() {
+    const String header = String("<https://api.github.com/repositories/1/issues?state=all&page=3>; rel=\"next\", ") +
+                          "<https://api.github.com/repositories/1/issues?state=all&page=7>; rel=\"last\", " +
+                          "<https://api.github.com/repositories/1/issues?page=1&state=all>; rel=\"first\"";
+    const PageLinks links = parsePageLinks(header);
+    assert links.next == 3l;
+    assert links.last == 7l;
+    assert links.first == 1l;
+    assert links.prev == 0l;
+    assert links.hasNext();
+    const PageLinks none = parsePageLinks(String(""));
+    assert !none.hasNext();
+    return true;
+}
+
+#[test]
+f<bool> testPaths() {
+    assert repoPath("spicelang", "spice") == "/repos/spicelang/spice";
+    assert repoPath("a b", "c/d") == "/repos/a%20b/c%2Fd";
+    assert encodePath("docs/my file.md") == "docs/my%20file.md";
+    assert issuePath("o", "r", 42l) == "/repos/o/r/issues/42";
+    Query query;
+    query.add("q", "language:spice stars:>10");
+    query.add("sort", "");
+    query.addLong("page", 2l);
+    query.addLong("per_page", 0l);
+    assert query.text == "?q=language%3Aspice%20stars%3A%3E10&page=2";
+    return true;
+}
+
+#[test]
+f<bool> testErrorDescription() {
+    GitHubError error;
+    error.status = 422s;
+    error.message = String("Validation Failed");
+    error.details.pushBack(String("title: missing_field"));
+    error.details.pushBack(String("Label does not exist"));
+    assert error.describe() == "422 Validation Failed (title: missing_field, Label does not exist)";
+    error.clear();
+    assert error.describe() == "";
+    return true;
+}

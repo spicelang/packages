@@ -1,0 +1,91 @@
+// ---------------------------------------------------------------------------------------------------------------------
+// Base64 (RFC 4648, standard alphabet with padding), as used by the contents API for file payloads
+// ---------------------------------------------------------------------------------------------------------------------
+
+const string BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * Encodes arbitrary bytes as Base64
+ *
+ * @param input Bytes to encode
+ * @return Base64 text with padding and without line breaks
+ */
+public f<String> encodeBase64(const String& input) {
+    result = String();
+    const unsigned long length = input.getLength();
+    result.reserve((length + 2l) / 3l * 4l);
+    unsigned long i = 0l;
+    while i < length {
+        const unsigned long remaining = length - i;
+        const int b0 = cast<int>(cast<byte>(input[i]));
+        const int b1 = remaining > 1l ? cast<int>(cast<byte>(input[i + 1l])) : 0;
+        const int b2 = remaining > 2l ? cast<int>(cast<byte>(input[i + 2l])) : 0;
+        const int triple = (b0 << 16) | (b1 << 8) | b2;
+        result.append(BASE64_ALPHABET[(triple >> 18) & 0x3F]);
+        result.append(BASE64_ALPHABET[(triple >> 12) & 0x3F]);
+        result.append(remaining > 1l ? BASE64_ALPHABET[(triple >> 6) & 0x3F] : '=');
+        result.append(remaining > 2l ? BASE64_ALPHABET[triple & 0x3F] : '=');
+        i += 3l;
+    }
+}
+
+/**
+ * Decodes Base64 text. Whitespace is skipped, since GitHub wraps encoded file contents into lines.
+ *
+ * @param input Base64 text
+ * @return Decoded bytes, or an error if the text contains characters outside the alphabet
+ */
+public f<Result<String>> decodeBase64(const String& input) {
+    String output = String();
+    output.reserve(input.getLength() / 4l * 3l);
+    int buffer = 0;
+    int bufferedBits = 0;
+    const unsigned long length = input.getLength();
+    for unsigned long i = 0l; i < length; i++ {
+        const char c = input[i];
+        if c == '=' { break; }
+        if c == ' ' || c == '\n' || c == '\r' || c == '\t' { continue; }
+        const int value = getBase64Value(c);
+        if value < 0 { return err<String>("Invalid Base64 character"); }
+        buffer = ((buffer << 6) | value) & 0xFFFFFF;
+        bufferedBits += 6;
+        if bufferedBits >= 8 {
+            bufferedBits -= 8;
+            output.append(cast<char>((buffer >> bufferedBits) & 0xFF));
+        }
+    }
+    return ok(output);
+}
+
+/**
+ * Returns the 6-bit value of a Base64 character
+ *
+ * @param c Character
+ * @return Value, or -1 if the character is not part of the alphabet
+ */
+f<int> getBase64Value(char c) {
+    if c >= 'A' && c <= 'Z' { return cast<int>(c) - cast<int>('A'); }
+    if c >= 'a' && c <= 'z' { return cast<int>(c) - cast<int>('a') + 26; }
+    if c >= '0' && c <= '9' { return cast<int>(c) - cast<int>('0') + 52; }
+    if c == '+' { return 62; }
+    if c == '/' { return 63; }
+    return -1;
+}
+
+#[test]
+f<bool> testBase64() {
+    assert encodeBase64(String("")) == "";
+    assert encodeBase64(String("f")) == "Zg==";
+    assert encodeBase64(String("fo")) == "Zm8=";
+    assert encodeBase64(String("foo")) == "Zm9v";
+    assert encodeBase64(String("foobar")) == "Zm9vYmFy";
+    assert encodeBase64(String("Hello, Spice!\n")) == "SGVsbG8sIFNwaWNlIQo=";
+    const Result<String> decoded = decodeBase64(String("SGVsbG8s\nIFNwaWNlIQo=\n"));
+    assert decoded.isOk();
+    assert decoded.unwrap() == "Hello, Spice!\n";
+    const Result<String> roundTrip = decodeBase64(encodeBase64(String("\xff\x7f binary")));
+    assert roundTrip.unwrap() == String("\xff\x7f binary");
+    const Result<String> invalid = decodeBase64(String("Zm9v!"));
+    assert invalid.isErr();
+    return true;
+}

@@ -1,0 +1,285 @@
+// Std imports
+import "std/data/vector";
+import "std/text/json/json-value";
+import "std/text/json/json-parser";
+import "std/text/json/json-serializer";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Lenient accessors for decoding GitHub answers and a small builder for request payloads.
+//
+// The std accessors of JsonValue panic on a missing field or an unexpected kind. GitHub leaves out fields depending on
+// the endpoint and the permissions of the token, and sends null for absent optional values, so the readers below keep
+// the target at its default in both cases instead.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Read-only view on a JSON object of a GitHub answer
+ */
+public type JsonReader struct {
+    JsonValue* object
+}
+
+/**
+ * Constructs a reader for the given value. Values other than objects are treated like an empty object.
+ *
+ * @param object Value to read from, may be nil
+ */
+public p JsonReader.ctor(JsonValue* object) {
+    this.object = object;
+}
+
+/**
+ * Returns the value of a field, if the field exists and is not null
+ *
+ * @param key Field key
+ * @return Field value or nil
+ */
+public f<JsonValue*> JsonReader.get(string key) {
+    if this.object == nil<JsonValue*> || !this.object.hasField(key) { return nil<JsonValue*>; }
+    JsonValue* value = this.object.getField(key);
+    return value.isNull() ? nil<JsonValue*> : value;
+}
+
+/**
+ * Checks whether a field exists and is not null
+ *
+ * @param key Field key
+ * @return Present or not
+ */
+public f<bool> JsonReader.has(string key) {
+    return this.get(key) != nil<JsonValue*>;
+}
+
+/**
+ * Reads a string field into the target. Other kinds leave the target untouched.
+ *
+ * @param key Field key
+ * @param target String to store the value in
+ */
+public p JsonReader.readString(string key, String& target) {
+    JsonValue* value = this.get(key);
+    if value != nil<JsonValue*> && value.isString() { target = value.getString(); }
+}
+
+/**
+ * Reads an integer field into the target. Other kinds leave the target untouched.
+ *
+ * @param key Field key
+ * @param target Long to store the value in
+ */
+public p JsonReader.readLong(string key, long& target) {
+    JsonValue* value = this.get(key);
+    if value != nil<JsonValue*> && value.isNumber() {
+        target = value.hasUnsignedIntegerValue() ? cast<long>(value.getUnsignedInteger()) : cast<long>(value.getNumber());
+    }
+}
+
+/**
+ * Reads a boolean field into the target. Other kinds leave the target untouched.
+ *
+ * @param key Field key
+ * @param target Bool to store the value in
+ */
+public p JsonReader.readBool(string key, bool& target) {
+    JsonValue* value = this.get(key);
+    if value != nil<JsonValue*> && value.isBool() { target = value.getBool(); }
+}
+
+/**
+ * Appends the string items of an array field to the target
+ *
+ * @param key Field key
+ * @param target Vector to append the items to
+ */
+public p JsonReader.readStringArray(string key, Vector<String>& target) {
+    JsonValue* value = this.get(key);
+    if value == nil<JsonValue*> || !value.isArray() { return; }
+    for unsigned long i = 0l; i < value.getArraySize(); i++ {
+        JsonValue* item = value.getArrayItem(i);
+        if item.isString() { target.pushBack(item.getString()); }
+    }
+}
+
+/**
+ * Returns a reader for a nested object field, which reads like an empty object if the field is absent
+ *
+ * @param key Field key
+ * @return Reader for the nested object
+ */
+public f<JsonReader> JsonReader.child(string key) {
+    JsonValue* value = this.get(key);
+    return JsonReader(value != nil<JsonValue*> && value.isObject() ? value : nil<JsonValue*>);
+}
+
+/**
+ * Returns the items of an array field, which is empty if the field is absent or no array
+ *
+ * @param key Field key
+ * @return Borrowed pointers to the items
+ */
+public f<Vector<JsonValue*>> JsonReader.items(string key) {
+    Vector<JsonValue*> items;
+    JsonValue* value = this.get(key);
+    if value != nil<JsonValue*> && value.isArray() {
+        for unsigned long i = 0l; i < value.getArraySize(); i++ {
+            items.pushBack(value.getArrayItem(i));
+        }
+    }
+    return items;
+}
+
+/**
+ * Builder for the JSON object payloads of write requests. Empty strings are left out by the `put...IfSet` variants, so
+ * update requests only carry the fields the caller actually wants to change.
+ */
+public type JsonBuilder struct {
+    JsonValue root
+}
+
+/**
+ * Constructs a builder for an empty object
+ */
+public p JsonBuilder.ctor() {
+    this.root = JsonValue(JsonValueKind::JSON_OBJECT);
+}
+
+/**
+ * Adds a string field
+ *
+ * @param key Field key
+ * @param value Field value
+ */
+public p JsonBuilder.putString(string key, const String& value) {
+    this.root.addObjectField(String(key), __new<JsonValue>(value));
+}
+
+/**
+ * Adds a string field, unless the value is empty
+ *
+ * @param key Field key
+ * @param value Field value
+ */
+public p JsonBuilder.putStringIfSet(string key, const String& value) {
+    if !value.isEmpty() { this.putString(key, value); }
+}
+
+/**
+ * Adds a boolean field
+ *
+ * @param key Field key
+ * @param value Field value
+ */
+public p JsonBuilder.putBool(string key, bool value) {
+    this.root.addObjectField(String(key), __new<JsonValue>(value));
+}
+
+/**
+ * Adds an integer field
+ *
+ * @param key Field key
+ * @param value Field value
+ */
+public p JsonBuilder.putLong(string key, long value) {
+    this.root.addObjectField(String(key), __new<JsonValue>(cast<unsigned long>(value)));
+}
+
+/**
+ * Adds an array of strings
+ *
+ * @param key Field key
+ * @param values Array items
+ */
+public p JsonBuilder.putStringArray(string key, const Vector<String>& values) {
+    JsonValue* array = __new<JsonValue>(JsonValueKind::JSON_ARRAY);
+    for unsigned long i = 0l; i < values.getSize(); i++ {
+        array.addArrayItem(__new<JsonValue>(values.get(i)));
+    }
+    this.root.addObjectField(String(key), array);
+}
+
+/**
+ * Adds a person object of the form {"name": "...", "email": "..."}, as used for committers
+ *
+ * @param key Field key
+ * @param name Name of the person
+ * @param email Email address of the person
+ */
+public p JsonBuilder.putPerson(string key, const String& name, const String& email) {
+    JsonValue* person = __new<JsonValue>(JsonValueKind::JSON_OBJECT);
+    person.addObjectField(String("name"), __new<JsonValue>(name));
+    person.addObjectField(String("email"), __new<JsonValue>(email));
+    this.root.addObjectField(String(key), person);
+}
+
+/**
+ * Adds an object with string values, built from parallel lists of keys and values
+ *
+ * @param key Field key
+ * @param keys Keys of the object
+ * @param values Values of the object, one per key
+ */
+public p JsonBuilder.putStringMap(string key, const Vector<String>& keys, const Vector<String>& values) {
+    JsonValue* object = __new<JsonValue>(JsonValueKind::JSON_OBJECT);
+    for unsigned long i = 0l; i < keys.getSize() && i < values.getSize(); i++ {
+        object.addObjectField(keys.get(i), __new<JsonValue>(values.get(i)));
+    }
+    this.root.addObjectField(String(key), object);
+}
+
+/**
+ * Serializes the object built so far
+ *
+ * @return Compact JSON text
+ */
+public f<String> JsonBuilder.build() {
+    JsonSerializer serializer;
+    return serializer.serialize(this.root);
+}
+
+#[test]
+f<bool> testJsonReader() {
+    Result<JsonValue*> parsed = parseJson(String("{\"s\":\"x\",\"n\":42,\"b\":true,\"z\":null,\"a\":[\"p\",1,\"q\"],\"o\":{\"k\":\"v\"}}"));
+    JsonValue* json = parsed.unwrap();
+    JsonReader reader = JsonReader(json);
+    String text = String("default");
+    long number = 0l;
+    bool flag = false;
+    reader.readString("s", text);
+    reader.readLong("n", number);
+    reader.readBool("b", flag);
+    assert text == "x" && number == 42l && flag;
+    // Missing fields, null and other kinds keep the default
+    reader.readString("missing", text);
+    reader.readString("z", text);
+    reader.readString("n", text);
+    assert text == "x";
+    assert reader.has("s") && !reader.has("z") && !reader.has("missing");
+    Vector<String> items;
+    reader.readStringArray("a", items);
+    assert items.getSize() == 2l;
+    JsonReader child = reader.child("o");
+    String value;
+    child.readString("k", value);
+    assert value == "v";
+    JsonReader absent = reader.child("missing");
+    absent.readString("k", value);
+    assert value == "v";
+    deleteJsonValue(json);
+    return true;
+}
+
+#[test]
+f<bool> testJsonBuilder() {
+    JsonBuilder builder;
+    builder.putString("title", String("a \"quoted\" title"));
+    builder.putStringIfSet("body", String(""));
+    builder.putBool("draft", true);
+    builder.putLong("milestone", 3l);
+    Vector<String> labels;
+    labels.pushBack(String("bug"));
+    builder.putStringArray("labels", labels);
+    builder.putPerson("committer", String("Bot"), String("bot@example.com"));
+    assert builder.build() ==
+        "{\"title\":\"a \\\"quoted\\\" title\",\"draft\":true,\"milestone\":3,\"labels\":[\"bug\"],\"committer\":{\"name\":\"Bot\",\"email\":\"bot@example.com\"}}";
+    return true;
+}

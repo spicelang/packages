@@ -1,0 +1,29 @@
+'github':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/github/**/*'
+
+'gtk4':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/gtk4/**/*'
+
+'libcurl':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/libcurl/**/*'
+
+'sqlite':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/sqlite/**/*'
+
+'documentation':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+
+'ci':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**/*'

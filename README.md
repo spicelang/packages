@@ -1,5 +1,7 @@
 # Official Spice Packages
 
+[![CI status](https://github.com/spicelang/packages/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/spicelang/packages/actions/workflows/ci.yml)
+
 ## Packages
 
 | Package                       | Description                                                                                     |

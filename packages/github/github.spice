@@ -3,6 +3,7 @@ import "std/data/vector";
 import "std/net/http";
 import "std/net/http-client";
 import "std/os/env";
+import "std/text/base64";
 import "std/text/json/json-value";
 import "std/text/analysis";
 import "std/text/json/json-parser";
@@ -10,7 +11,6 @@ import "std/text/string-ext";
 import "std/type/type-conversion";
 
 // Own imports
-import "src/base64";
 import "src/json";
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1576,6 +1576,19 @@ f<String> encodePath(string path) {
 }
 
 /**
+ * Removes all whitespace from a text. GitHub wraps the Base64 payload of files into lines, which the std decoder rejects
+ */
+f<String> stripWhitespace(const String& text) {
+    result = String();
+    const unsigned long length = text.getLength();
+    result.reserve(length);
+    for unsigned long i = 0l; i < length; i++ {
+        const char c = text[i];
+        if c != ' ' && c != '\n' && c != '\r' && c != '\t' { result.append(c); }
+    }
+}
+
+/**
  * Appends the pagination parameters to a query
  */
 p GitHubClient.addPage(Query& query, long page) {
@@ -1977,7 +1990,7 @@ f<Result<Content>> GitHubClient.fetchFile(const String& path) {
     reader.readString("content", encoded);
     deleteJsonValue(root);
     if encoding == "base64" {
-        Result<String> decoded = decodeBase64(encoded);
+        Result<String> decoded = decodeBase64(stripWhitespace(encoded));
         if decoded.isErr() { return this.failDecoding<Content>(); }
         file.content = decoded.unwrap();
     } else if encoding == "none" {
@@ -2843,6 +2856,18 @@ f<bool> testPaths() {
     query.addLong("page", 2l);
     query.addLong("per_page", 0l);
     assert query.text == "?q=language%3Aspice%20stars%3A%3E10&page=2";
+    return true;
+}
+
+#[test]
+f<bool> testFilePayload() {
+    assert stripWhitespace(String("SGVsbG8s\nIFNwaWNlIQo=\n")) == "SGVsbG8sIFNwaWNlIQo=";
+    const Result<String> decoded = decodeBase64(stripWhitespace(String("SGVsbG8s\r\nIFNwaWNlIQo=\n")));
+    assert decoded.isOk();
+    assert decoded.unwrap() == "Hello, Spice!\n";
+    assert encodeBase64(String("Hello, Spice!\n")) == "SGVsbG8sIFNwaWNlIQo=";
+    const Result<String> invalid = decodeBase64(stripWhitespace(String("Zm9v!")));
+    assert invalid.isErr();
     return true;
 }
 

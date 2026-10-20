@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  test:
+    name: Test packages
+    runs-on: ubuntu-26.04
+    # The job only reads the repository and the latest Spice release
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install package dependencies
+        # Libraries that the binding packages link against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libcurl4-openssl-dev libsqlite3-dev
+
+      - name: Install Spice
+        # The release archive ships the compiler and the std, which the compiler finds via SPICE_STD_DIR
+        run: |
+          SPICE_DIR="$RUNNER_TOOL_CACHE/spice"
+          mkdir -p "$SPICE_DIR"
+          curl -fsSL https://github.com/spicelang/spice/releases/latest/download/spice_linux_amd64.tar.gz | tar xz -C "$SPICE_DIR"
+          echo "$SPICE_DIR" >> "$GITHUB_PATH"
+          echo "SPICE_STD_DIR=$SPICE_DIR/std" >> "$GITHUB_ENV"
+          "$SPICE_DIR/spice" --version
+
+      - name: Run tests
+        # Tests every package with the entry file of its spice.toml. All packages are tested, even if one of them fails
+        run: |
+          failed=()
+          for manifest in packages/*/spice.toml; do
+            dir=$(dirname "$manifest")
+            entry=$(sed -n 's/^entry *= *"\(.*\)"/\1/p' "$manifest")
+            echo "::group::$(basename "$dir")"
+            if ! (cd "$dir" && spice test -O0 "$entry"); then
+              failed+=("$(basename "$dir")")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::Tests failed for: ${failed[*]}"
+            exit 1
+          fi

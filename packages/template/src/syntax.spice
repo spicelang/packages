@@ -146,6 +146,9 @@ public type TplTemplate struct {
     public Vector<int> macros        // Top-level macros
     public int extendsNode = -1      // Top-level extends
     public int loopDepth = 0         // While parsing: number of enclosing loops (for break/continue)
+    public bool deferred = false     // Added with lazy compilation and not compiled yet: `source` and `options` are kept
+    public String source
+    public TplOptions options
 }
 
 /**

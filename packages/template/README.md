@@ -105,6 +105,7 @@ Result<TemplateValue> parsed = templateJson("{\"posts\": [{\"title\": \"Hello\"}
 | `strictUndefined`                      | Outputting, looping over or reading attributes of undefined values is an error |
 | `trimBlocks`, `lstripBlocks`           | Jinja whitespace options                                                       |
 | `stripIndentation`                     | Drop whitespace with line breaks between markup, for compact HTML              |
+| `lazyCompile`                          | Compile a template when it is first used, not in `add` (see below)             |
 | `maxDepth`                             | Limit for nested includes, macro calls and inheritance (default 64)            |
 | `lastError`                            | `name:line: message` of the last failure                                       |
 
@@ -237,3 +238,13 @@ partials/row.html:1: cannot compare int and string
 ```
 
 Run `engine.check()` at startup or in a test to catch broken templates and missing includes early.
+
+## Lazy compilation
+
+`add` compiles a template right away. If an engine holds many templates but a render only uses a few of them, for
+example when it is set up anew for every request, set `lazyCompile = true` before adding them: `add` then only stores
+the source, and a template is compiled the first time it is rendered, included, imported or extended. Templates that a
+render never reaches cost nothing. `add` cannot see syntax errors in this mode and returns `true`; they are reported when
+the template is used, and `check()` compiles every template, so it still finds all of them. Like the whitespace options,
+the setting applies to templates added afterwards, and a template is compiled with the options in effect when it was
+added.

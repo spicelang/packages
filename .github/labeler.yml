@@ -13,6 +13,11 @@
       - any-glob-to-any-file:
           - 'packages/libcurl/**/*'
 
+'semver':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/semver/**/*'
+
 'sqlite':
   - changed-files:
       - any-glob-to-any-file:

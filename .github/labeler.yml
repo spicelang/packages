@@ -18,6 +18,11 @@
       - any-glob-to-any-file:
           - 'packages/sqlite/**/*'
 
+'template':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/template/**/*'
+
 'documentation':
   - changed-files:
       - any-glob-to-any-file:

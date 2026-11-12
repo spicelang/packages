@@ -4,6 +4,13 @@ import "std/io/dir";
 import "std/io/file";
 import "std/type/lambda";
 
+import "std/data/algorithm" as algorithm;
+import "std/data/optional";
+import "std/math/fct";
+import "std/text/analysis";
+import "std/text/format";
+import "std/type/type-conversion";
+
 // Own imports
 import "src/text";
 import "src/syntax";
@@ -26,6 +33,12 @@ import "src/syntax";
 // ---------------------------------------------------------------------------------------------------------------------
 
 // ====================================================== Values =======================================================
+
+// Generic parameter types of the API
+type Text string|String;                                // Names, keys and text
+type Integer int|long|short;                            // Whole numbers
+type Source string|String;                              // Template sources
+type Scalar bool|int|long|short|double|string|String;   // Everything that becomes a simple value
 
 /**
  * A value that a template can read or compute
@@ -53,14 +66,9 @@ public p TemplateValue.ctor(bool value) {
     this.flag = value;
 }
 
-public p TemplateValue.ctor(int value) {
+public p TemplateValue.ctor<Integer>(Integer value) {
     this.kind = TV_INT;
     this.num = cast<long>(value);
-}
-
-public p TemplateValue.ctor(long value) {
-    this.kind = TV_INT;
-    this.num = value;
 }
 
 public p TemplateValue.ctor(double value) {
@@ -68,14 +76,9 @@ public p TemplateValue.ctor(double value) {
     this.real = value;
 }
 
-public p TemplateValue.ctor(string value) {
+public p TemplateValue.ctor<Text>(const Text& value) {
     this.kind = TV_STRING;
     this.text = String(value);
-}
-
-public p TemplateValue.ctor(const String& value) {
-    this.kind = TV_STRING;
-    this.text = value;
 }
 
 // ------------------------------------------------------ Kinds -------------------------------------------------------
@@ -143,51 +146,39 @@ public p TemplateValue.push(const TemplateValue& item) {
     this.items.pushBack(item);
 }
 
-public p TemplateValue.push(string item) { this.push(TemplateValue(item)); }
-
-public p TemplateValue.push(const String& item) { this.push(TemplateValue(item)); }
-
-public p TemplateValue.push(long item) { this.push(TemplateValue(item)); }
-
-public p TemplateValue.push(int item) { this.push(TemplateValue(item)); }
-
-public p TemplateValue.push(double item) { this.push(TemplateValue(item)); }
-
-public p TemplateValue.push(bool item) { this.push(TemplateValue(item)); }
+/**
+ * Append a bool, number or text to a list
+ */
+public p TemplateValue.push<Scalar>(const Scalar& item) {
+    this.push(TemplateValue(item));
+}
 
 /**
  * Set a key of a map, replacing an existing entry. A value that is not a map becomes an empty map first.
  */
-public p TemplateValue.set(const String& key, const TemplateValue& item) {
+public p TemplateValue.set<Text>(const Text& key, const TemplateValue& item) {
     this.makeMap();
-    const long idx = this.indexOf(key.getRaw());
+    const long idx = this.indexOf(key);
     if idx >= 0l {
         TemplateValue& slot = this.items.get(cast<unsigned long>(idx));
         slot = item;
         return;
     }
-    this.keys.pushBack(key);
+    this.keys.pushBack(String(key));
     this.items.pushBack(item);
 }
 
-public p TemplateValue.set(string key, const TemplateValue& item) { this.set(String(key), item); }
-
-public p TemplateValue.set(string key, string item) { this.set(String(key), TemplateValue(item)); }
-
-public p TemplateValue.set(string key, const String& item) { this.set(String(key), TemplateValue(item)); }
-
-public p TemplateValue.set(string key, long item) { this.set(String(key), TemplateValue(item)); }
-
-public p TemplateValue.set(string key, int item) { this.set(String(key), TemplateValue(item)); }
-
-public p TemplateValue.set(string key, double item) { this.set(String(key), TemplateValue(item)); }
-
-public p TemplateValue.set(string key, bool item) { this.set(String(key), TemplateValue(item)); }
+/**
+ * Set a key of a map to a bool, number or text
+ */
+public p TemplateValue.set<Text, Scalar>(const Text& key, const Scalar& item) {
+    this.set(key, TemplateValue(item));
+}
 
 /**
  * Remove a key of a map. Returns whether it existed.
  */
-public f<bool> TemplateValue.remove(string key) {
+public f<bool> TemplateValue.remove<Text>(const Text& key) {
     const long idx = this.indexOf(key);
     if idx < 0l { return false; }
     // Vector.removeAt cannot be used for items that own memory, so the vectors are rebuilt
@@ -208,7 +199,7 @@ public f<bool> TemplateValue.remove(string key) {
 /**
  * Position of a key in a map, or -1
  */
-public f<long> TemplateValue.indexOf(string key) {
+public f<long> TemplateValue.indexOf<Text>(const Text& key) {
     if this.kind != TV_MAP { return -1l; }
     for unsigned long i = 0l; i < this.keys.getSize(); i++ {
         if this.keys.get(i) == key { return cast<long>(i); }
@@ -216,14 +207,14 @@ public f<long> TemplateValue.indexOf(string key) {
     return -1l;
 }
 
-public f<bool> TemplateValue.has(string key) {
+public f<bool> TemplateValue.has<Text>(const Text& key) {
     return this.indexOf(key) >= 0l;
 }
 
 /**
  * The value of a key of a map, or an undefined value
  */
-public f<TemplateValue> TemplateValue.get(string key) {
+public f<TemplateValue> TemplateValue.get<Text>(const Text& key) {
     const long idx = this.indexOf(key);
     if idx < 0l { return TemplateValue(); }
     return this.items.get(cast<unsigned long>(idx));
@@ -285,7 +276,7 @@ public f<double> TemplateValue.asDouble() {
  */
 public f<String> TemplateValue.toString() {
     if this.kind == TV_STRING { return this.text; }
-    if this.kind == TV_INT { return tplFormatLong(this.num); }
+    if this.kind == TV_INT { return toString(this.num); }
     if this.kind == TV_FLOAT { return tplFormatDouble(this.real); }
     if this.kind == TV_BOOL { return String(this.flag ? "true" : "false"); }
     if this.kind == TV_LIST || this.kind == TV_MAP { return this.toJson(); }
@@ -314,9 +305,9 @@ f<TemplateValue> tplParseNumber(const String& input) {
 }
 
 /**
- * Deep equality. Integers and floats compare by their numeric value.
+ * Deep equality. Integers and floats compare by their numeric value, undefined equals null.
  */
-public f<bool> tplEqual(const TemplateValue& a, const TemplateValue& b) {
+public f<bool> operator==(const TemplateValue& a, const TemplateValue& b) {
     if a.isNumber() && b.isNumber() {
         if a.kind == TV_INT && b.kind == TV_INT { return a.num == b.num; }
         const TemplateValue& ca = a;
@@ -333,12 +324,16 @@ public f<bool> tplEqual(const TemplateValue& a, const TemplateValue& b) {
         if a.items.getSize() != b.items.getSize() { return false; }
         for unsigned long i = 0l; i < a.items.getSize(); i++ {
             if a.kind == TV_MAP && a.keys.get(i) != b.keys.get(i) { return false; }
-            if !tplEqual(a.items.get(i), b.items.get(i)) { return false; }
+            if a.items.get(i) != b.items.get(i) { return false; }
         }
         return true;
     }
     if a.kind == TV_MACRO || a.kind == TV_CALLER { return a.tpl == b.tpl && a.node == b.node; }
     return true;
+}
+
+public f<bool> operator!=(const TemplateValue& a, const TemplateValue& b) {
+    return !(a == b);
 }
 
 /**
@@ -409,7 +404,7 @@ p tplWriteJsonString(String& out, const String& text, bool htmlSafe) {
 
 p tplWriteJson(String& out, const TemplateValue& v, bool htmlSafe) {
     if v.kind == TV_BOOL { out += v.flag ? "true" : "false"; }
-    else if v.kind == TV_INT { out += tplFormatLong(v.num); }
+    else if v.kind == TV_INT { out += toString(v.num); }
     else if v.kind == TV_FLOAT {
         const String text = tplFormatDouble(v.real);
         // JSON has no infinity or NaN
@@ -448,12 +443,12 @@ public type TplJsonParser struct {
 
 p TplJsonParser.fail(string message) {
     if this.error.isEmpty() {
-        this.error = String(message) + " at offset " + tplFormatLong(cast<long>(this.pos));
+        this.error = String(message) + " at offset " + toString(cast<long>(this.pos));
     }
 }
 
 p TplJsonParser.skipSpace() {
-    while this.pos < this.input.getLength() && tplIsSpace(this.input[this.pos]) { this.pos++; }
+    while this.pos < this.input.getLength() && isWhitespace(this.input[this.pos]) { this.pos++; }
 }
 
 f<bool> TplJsonParser.literal(string word) {
@@ -571,7 +566,7 @@ f<TemplateValue> TplJsonParser.parseValue(int depth) {
     const unsigned long start = this.pos;
     while this.pos < len {
         const char d = this.input[this.pos];
-        if !(tplIsDigit(d) || d == '-' || d == '+' || d == '.' || d == 'e' || d == 'E') { break; }
+        if !(isDigit(d) || d == '-' || d == '+' || d == '.' || d == 'e' || d == 'E') { break; }
         this.pos++;
     }
     const TemplateValue number = tplParseNumber(this.input.getSubstring(start, cast<long>(this.pos - start)));
@@ -620,11 +615,9 @@ public f<unsigned long> TemplateArgs.count() {
  * The argument at the position, or the named argument with the name, or an undefined value
  */
 public f<TemplateValue> TemplateArgs.get(unsigned long index, string name) {
-    for unsigned long i = 0l; i < this.names.getSize(); i++ {
-        if this.names.get(i) == name { return this.named.get(i); }
-    }
-    if index < this.positional.getSize() { return this.positional.get(index); }
-    return TemplateValue();
+    const TemplateValue keyword = this.byName(name);
+    if keyword.kind != TV_UNDEFINED { return keyword; }
+    return this.at(index);
 }
 
 /**
@@ -655,18 +648,6 @@ f<TemplateValue> TemplateArgs.getOr(unsigned long index, string name, const Temp
 }
 
 // ------------------------------------------------------ Helpers -----------------------------------------------------
-
-f<TemplateValue> tplSafe(const String& text) {
-    TemplateValue v = TemplateValue(text);
-    v.safe = true;
-    return v;
-}
-
-f<TemplateValue> tplEmptyList() {
-    TemplateValue v;
-    v.makeList();
-    return v;
-}
 
 /**
  * Number of items of a list or map, characters of a string
@@ -701,12 +682,7 @@ public f<bool> tplContains(const TemplateValue& container, const TemplateValue& 
         const String needle = item.toString();
         return container.text.contains(needle.getRaw());
     }
-    if container.kind == TV_LIST {
-        for unsigned long i = 0l; i < container.items.getSize(); i++ {
-            if tplEqual(container.items.get(i), item) { return true; }
-        }
-        return false;
-    }
+    if container.kind == TV_LIST { return algorithm::contains(container.items, item); }
     if container.kind == TV_MAP {
         const String key = item.toString();
         return container.indexOf(key.getRaw()) >= 0l;
@@ -753,7 +729,7 @@ f<String> tplFormat(const String& pattern, const TemplateArgs& args) {
         char spec = pattern[i + 1l];
         int precision = 6;
         unsigned long skip = 2l;
-        if spec == '.' && i + 3l < len && tplIsDigit(pattern[i + 2l]) {
+        if spec == '.' && i + 3l < len && isDigit(pattern[i + 2l]) {
             precision = cast<int>(pattern[i + 2l]) - 48;
             spec = pattern[i + 3l];
             skip = 4l;
@@ -761,8 +737,8 @@ f<String> tplFormat(const String& pattern, const TemplateArgs& args) {
         if spec == '%' { out.append('%'); i += 2l; continue; }
         const TemplateValue arg = args.at(next);
         next++;
-        if spec == 'd' || spec == 'i' { out += tplFormatLong(arg.asLong()); }
-        else if spec == 'f' { out += tplFormatFixed(arg.asDouble(), precision); }
+        if spec == 'd' || spec == 'i' { out += toString(arg.asLong()); }
+        else if spec == 'f' { out += toString(arg.asDouble(), precision); }
         else { out += arg.toString(); }
         i += skip;
     }
@@ -850,7 +826,7 @@ p tplMergeSort(Vector<unsigned long>& order, Vector<unsigned long>& buffer, unsi
 f<TemplateValue> tplSortKey(const TemplateValue& item, const TemplateValue& attribute, bool caseSensitive) {
     TemplateValue key = item;
     if attribute.kind == TV_STRING { key = tplAttribute(item, attribute.text); }
-    if !caseSensitive && key.kind == TV_STRING { key.text = tplLower(key.text); }
+    if !caseSensitive && key.kind == TV_STRING { key.text = toLower(key.text); }
     return key;
 }
 
@@ -869,19 +845,16 @@ f<TemplateValue> tplSorted(const TemplateValue& input, bool reverse, bool caseSe
 
 f<TemplateValue> tplMinMax(const TemplateValue& input, bool wantMax, bool caseSensitive, const TemplateValue& attribute) {
     const TemplateValue list = tplIterable(input);
-    if list.items.getSize() == 0l { return TemplateValue(); }
-    unsigned long best = 0l;
-    TemplateValue bestKey = tplSortKey(list.items.get(0l), attribute, caseSensitive);
-    for unsigned long i = 1l; i < list.items.getSize(); i++ {
-        const TemplateValue key = tplSortKey(list.items.get(i), attribute, caseSensitive);
-        bool ok = true;
-        const int cmp = tplCompare(key, bestKey, ok);
-        if ok && ((wantMax && cmp > 0) || (!wantMax && cmp < 0)) {
-            best = i;
-            bestKey = key;
-        }
-    }
-    return list.items.get(best);
+    // Values that cannot be ordered count as equal, so the first of them wins
+    f<bool>(const TemplateValue&, const TemplateValue&) isLess = f<bool>(const TemplateValue& a, const TemplateValue& b) {
+        bool comparable = true;
+        const int cmp = tplCompare(tplSortKey(a, attribute, caseSensitive), tplSortKey(b, attribute, caseSensitive), comparable);
+        return comparable && cmp < 0;
+    };
+    Optional<TemplateValue> best;
+    if wantMax { best = algorithm::max(list.items, isLess); } else { best = algorithm::min(list.items, isLess); }
+    if !best.isPresent() { return TemplateValue(); }
+    return best.get();
 }
 
 // ---------------------------------------------------- Built-in tests -------------------------------------------------
@@ -914,16 +887,16 @@ public f<bool> tplApplyTest(const String& name, const TemplateValue& v, const Te
         const long divisor = arg.asLong();
         out = divisor != 0l && v.asLong() % divisor == 0l;
     }
-    else if name == "eq" || name == "equalto" || name == "==" { out = tplEqual(v, arg); }
-    else if name == "ne" || name == "!=" { out = !tplEqual(v, arg); }
+    else if name == "eq" || name == "equalto" || name == "==" { out = v == arg; }
+    else if name == "ne" || name == "!=" { out = v != arg; }
     else if name == "lt" || name == "lessthan" || name == "<" { out = tplCompare(v, arg, ok) < 0 && ok; }
     else if name == "le" || name == "<=" { out = tplCompare(v, arg, ok) <= 0 && ok; }
     else if name == "gt" || name == "greaterthan" || name == ">" { out = tplCompare(v, arg, ok) > 0 && ok; }
     else if name == "ge" || name == ">=" { out = tplCompare(v, arg, ok) >= 0 && ok; }
     else if name == "in" { out = tplContains(arg, v); }
-    else if name == "sameas" { out = v.kind == arg.kind && tplEqual(v, arg); }
-    else if name == "lower" { out = v.kind == TV_STRING && tplLower(v.text) == v.text; }
-    else if name == "upper" { out = v.kind == TV_STRING && tplUpper(v.text) == v.text; }
+    else if name == "sameas" { out = v.kind == arg.kind && v == arg; }
+    else if name == "lower" { out = v.kind == TV_STRING && toLower(v.text) == v.text; }
+    else if name == "upper" { out = v.kind == TV_STRING && toUpper(v.text) == v.text; }
     else if name == "startingwith" || name == "startswith" {
         const String prefix = arg.toString();
         out = v.kind == TV_STRING && v.text.startsWith(prefix.getRaw());
@@ -941,7 +914,7 @@ public f<bool> tplApplyTest(const String& name, const TemplateValue& v, const Te
  */
 f<bool> tplSelect(const TemplateValue& input, const TemplateArgs& args, unsigned long from, bool reject, const TemplateValue& attribute, TemplateValue& out, String& error) {
     const TemplateValue list = tplIterable(input);
-    out = tplEmptyList();
+    out = templateList();
     String testName;
     TemplateArgs testArgs;
     if from < args.positional.getSize() {
@@ -981,7 +954,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
     }
     if name == "escape" || name == "e" || name == "forceescape" {
         if v.kind == TV_STRING && v.safe && name != "forceescape" { out = v; return true; }
-        out = tplSafe(tplEscapeHtml(v.toString()));
+        out = templateSafe(tplEscapeHtml(v.toString()));
         return true;
     }
     if name == "default" || name == "d" {
@@ -994,9 +967,9 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
 
     // Text
     if name == "string" { out = TemplateValue(v.toString()); out.safe = v.safe; return true; }
-    if name == "lower" { out = TemplateValue(tplLower(v.toString())); return true; }
-    if name == "upper" { out = TemplateValue(tplUpper(v.toString())); return true; }
-    if name == "capitalize" { out = TemplateValue(tplCapitalize(v.toString())); return true; }
+    if name == "lower" { out = TemplateValue(toLower(v.toString())); return true; }
+    if name == "upper" { out = TemplateValue(toUpper(v.toString())); return true; }
+    if name == "capitalize" { out = TemplateValue(capitalize(toLower(v.toString()))); return true; }
     if name == "title" { out = TemplateValue(tplTitle(v.toString())); return true; }
     if name == "trim" || name == "strip" {
         const TemplateValue chars = args.get(0l, "chars");
@@ -1065,7 +1038,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         String escaped = v.text;
         if !(v.kind == TV_STRING && v.safe) { escaped = tplEscapeHtml(v.toString()); }
         const String unixLines = tplReplace(escaped, String("\r\n"), String("\n"), -1l);
-        out = tplSafe(tplReplace(unixLines, String("\n"), String("<br>\n"), -1l));
+        out = templateSafe(tplReplace(unixLines, String("\n"), String("<br>\n"), -1l));
         return true;
     }
     if name == "urlencode" || name == "url" { out = TemplateValue(tplUrlEncodeValue(v)); return true; }
@@ -1075,17 +1048,17 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         String sep;
         if separator.kind != TV_UNDEFINED { sep = separator.toString(); }
         const Vector<String> parts = tplSplit(v.toString(), sep);
-        out = tplEmptyList();
+        out = templateList();
         for unsigned long i = 0l; i < parts.getSize(); i++ { out.push(parts.get(i)); }
         return true;
     }
     if name == "xmlattr" {
         const TemplateValue autospace = args.getOr(0l, "autospace", TemplateValue(true));
-        out = tplSafe(tplXmlAttr(v, autospace.truthy()));
+        out = templateSafe(tplXmlAttr(v, autospace.truthy()));
         return true;
     }
     if name == "tojson" || name == "json" {
-        out = tplSafe(v.toJson(true));
+        out = templateSafe(v.toJson(true));
         return true;
     }
 
@@ -1105,8 +1078,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         return true;
     }
     if name == "abs" {
-        if v.kind == TV_INT { out = TemplateValue(v.num < 0l ? -v.num : v.num); }
-        else { const double d = v.asDouble(); out = TemplateValue(d < 0.0 ? -d : d); }
+        if v.kind == TV_INT { out = TemplateValue(abs(v.num)); } else { out = TemplateValue(abs(v.asDouble())); }
         return true;
     }
     if name == "round" {
@@ -1145,7 +1117,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
             return true;
         }
         const TemplateValue list = tplIterable(v);
-        out = tplEmptyList();
+        out = templateList();
         for unsigned long i = list.items.getSize(); i > 0l; i-- { out.push(list.items.get(i - 1l)); }
         return true;
     }
@@ -1169,7 +1141,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         return true;
     }
     if name == "keys" || name == "values" || name == "items" {
-        out = tplEmptyList();
+        out = templateList();
         if v.kind != TV_MAP { return true; }
         for unsigned long i = 0l; i < v.items.getSize(); i++ {
             if name == "keys" { out.push(v.keys.get(i)); }
@@ -1187,7 +1159,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         const TemplateValue caseSensitive = args.get(0l, "case_sensitive");
         const TemplateValue by = args.getOr(1l, "by", TemplateValue("key"));
         const TemplateValue reverse = args.get(2l, "reverse");
-        TemplateValue pairs = tplEmptyList();
+        TemplateValue pairs = templateList();
         Vector<TemplateValue> keys;
         if v.kind == TV_MAP {
             for unsigned long i = 0l; i < v.items.getSize(); i++ {
@@ -1197,12 +1169,12 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
                 pairs.push(pair);
                 TemplateValue key = TemplateValue(v.keys.get(i));
                 if by.toString() == "value" { key = v.items.get(i); }
-                if !caseSensitive.truthy() && key.kind == TV_STRING { key.text = tplLower(key.text); }
+                if !caseSensitive.truthy() && key.kind == TV_STRING { key.text = toLower(key.text); }
                 keys.pushBack(key);
             }
         }
         const Vector<unsigned long> order = tplSortedOrder(keys, reverse.truthy());
-        out = tplEmptyList();
+        out = templateList();
         for unsigned long i = 0l; i < order.getSize(); i++ { out.push(pairs.items.get(order.get(i))); }
         return true;
     }
@@ -1217,15 +1189,11 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         const TemplateValue caseSensitive = args.get(0l, "case_sensitive");
         const TemplateValue attribute = args.get(1l, "attribute");
         const TemplateValue list = tplIterable(v);
-        out = tplEmptyList();
+        out = templateList();
         Vector<TemplateValue> seen;
         for unsigned long i = 0l; i < list.items.getSize(); i++ {
             const TemplateValue key = tplSortKey(list.items.get(i), attribute, caseSensitive.truthy());
-            bool known = false;
-            for unsigned long k = 0l; k < seen.getSize(); k++ {
-                if tplEqual(seen.get(k), key) { known = true; break; }
-            }
-            if !known {
+            if !algorithm::contains(seen, key) {
                 seen.pushBack(key);
                 out.push(list.items.get(i));
             }
@@ -1261,13 +1229,13 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         if size <= 0l { error = String("batch needs a positive size"); return true; }
         const TemplateValue fill = args.get(1l, "fill_with");
         const TemplateValue list = tplIterable(v);
-        out = tplEmptyList();
-        TemplateValue current = tplEmptyList();
+        out = templateList();
+        TemplateValue current = templateList();
         for unsigned long i = 0l; i < list.items.getSize(); i++ {
             current.push(list.items.get(i));
             if cast<long>(current.items.getSize()) == size {
                 out.push(current);
-                current = tplEmptyList();
+                current = templateList();
             }
         }
         if current.items.getSize() > 0l {
@@ -1286,10 +1254,10 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         const long n = cast<long>(list.items.getSize());
         const long per = n / columns;
         const long extra = n % columns;
-        out = tplEmptyList();
+        out = templateList();
         long pos = 0l;
         for long c = 0l; c < columns; c++ {
-            TemplateValue column = tplEmptyList();
+            TemplateValue column = templateList();
             const long take = per + (c < extra ? 1l : 0l);
             for long k = 0l; k < take; k++ { column.push(list.items.get(cast<unsigned long>(pos + k))); }
             pos += take;
@@ -1301,7 +1269,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
         const TemplateValue attribute = args.get(0l, "attribute");
         if attribute.kind != TV_STRING { error = String("groupby needs an attribute"); return true; }
         const TemplateValue sorted = tplSorted(v, false, true, attribute);
-        out = tplEmptyList();
+        out = templateList();
         for unsigned long i = 0l; i < sorted.items.getSize(); i++ {
             const TemplateValue item = sorted.items.get(i);
             const TemplateValue key = tplAttribute(item, attribute.text);
@@ -1309,7 +1277,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
             if groups > 0l {
                 TemplateValue& last = out.items.get(groups - 1l);
                 const TemplateValue lastKey = last.get("grouper");
-                if tplEqual(lastKey, key) {
+                if lastKey == key {
                     TemplateValue& members = last.items.get(1l);
                     members.push(item);
                     continue;
@@ -1317,7 +1285,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
             }
             TemplateValue group;
             group.set("grouper", key);
-            TemplateValue members = tplEmptyList();
+            TemplateValue members = templateList();
             members.push(item);
             group.set("list", members);
             out.push(group);
@@ -1340,7 +1308,7 @@ public f<bool> tplApplyFilter(const String& name, const TemplateValue& v, const 
     if name == "map" {
         const TemplateValue attribute = args.byName("attribute");
         const TemplateValue list = tplIterable(v);
-        out = tplEmptyList();
+        out = templateList();
         if attribute.kind == TV_STRING {
             const TemplateValue fallback = args.byName("default");
             for unsigned long i = 0l; i < list.items.getSize(); i++ {
@@ -1376,14 +1344,26 @@ const int TPL_FLOW_NONE = 0;
 const int TPL_FLOW_BREAK = 1;
 const int TPL_FLOW_CONTINUE = 2;
 
-type TplFilterEntry struct {
+// Signature of a registered filter or function
+type Fn dyn;
+
+/**
+ * A custom filter or function under its name
+ */
+type TplRegistered<Fn> struct {
     public String name
-    public Lambda<f<TemplateValue>(const TemplateValue&, const TemplateArgs&)> fn
+    public Lambda<Fn> fn
 }
 
-type TplFunctionEntry struct {
-    public String name
-    public Lambda<f<TemplateValue>(const TemplateArgs&)> fn
+/**
+ * Position of the entry with the name, or -1
+ */
+f<long> tplFindRegistered<Fn>(const Vector<TplRegistered<Fn>>& entries, const String& name) {
+    for unsigned long i = 0l; i < entries.getSize(); i++ {
+        const TplRegistered<Fn>& entry = entries.get(i);
+        if entry.name == name { return cast<long>(i); }
+    }
+    return -1l;
 }
 
 /**
@@ -1399,8 +1379,8 @@ public type TemplateEngine struct {
     public String lastError                // Description of the last problem, "name:line: message"
     public TemplateValue globals           // Values every template can read
     Vector<TplTemplate> templates
-    Vector<TplFilterEntry> filters
-    Vector<TplFunctionEntry> functions
+    Vector<TplRegistered<f<TemplateValue>(const TemplateValue&, const TemplateArgs&)>> filters
+    Vector<TplRegistered<f<TemplateValue>(const TemplateArgs&)>> functions
 }
 
 // ===================================================== Renderer ======================================================
@@ -1467,20 +1447,13 @@ f<TemplateValue> tplLiteral(const TplExpr& ex) {
     return v;
 }
 
-f<TemplateValue> tplSafeValue(const String& text) {
-    TemplateValue v = TemplateValue(text);
-    v.safe = true;
-    return v;
-}
-
-p TplRenderer.fail(int t, int line, const String& message) {
+/**
+ * Record the first problem, "name:line: message"
+ */
+p TplRenderer.fail<Text>(int t, int line, const Text& message) {
     if !this.error.isEmpty() { return; }
     const TplTemplate& tpl = this.engine.templates.get(cast<unsigned long>(t));
-    this.error = tpl.name + ":" + tplFormatLong(cast<long>(line)) + ": " + message;
-}
-
-p TplRenderer.fail(int t, int line, string message) {
-    this.fail(t, line, String(message));
+    this.error = tpl.name + ":" + toString(line) + ": " + message;
 }
 
 f<bool> TplRenderer.ok() {
@@ -1632,28 +1605,24 @@ f<TemplateArgs> TplRenderer.evalArgs(int t, int e) {
 
 f<TemplateValue> TplRenderer.applyFilter(int t, int line, const String& name, const TemplateValue& input, const TemplateArgs& args) {
     // Custom filters first, so they can replace built-in ones
-    for unsigned long i = 0l; i < this.engine.filters.getSize(); i++ {
-        TplFilterEntry& entry = this.engine.filters.get(i);
-        if entry.name == name {
-            f<TemplateValue>(const TemplateValue&, const TemplateArgs&) fn = entry.fn.get();
-            return fn(input, args);
-        }
+    const long custom = tplFindRegistered(this.engine.filters, name);
+    if custom >= 0l {
+        f<TemplateValue>(const TemplateValue&, const TemplateArgs&) fn = this.engine.filters.get(cast<unsigned long>(custom)).fn.get();
+        return fn(input, args);
     }
     // map("custom_filter") with a custom filter
     if name == "map" && args.positional.getSize() > 0l {
         const TemplateValue filterName = args.positional.get(0l);
-        for unsigned long i = 0l; i < this.engine.filters.getSize(); i++ {
-            TplFilterEntry& entry = this.engine.filters.get(i);
-            if filterName.kind == TV_STRING && entry.name == filterName.text {
-                f<TemplateValue>(const TemplateValue&, const TemplateArgs&) fn = entry.fn.get();
-                TemplateArgs inner;
-                for unsigned long k = 1l; k < args.positional.getSize(); k++ { inner.positional.pushBack(args.positional.get(k)); }
-                const TemplateValue items = tplIterable(input);
-                TemplateValue mapped;
-                mapped.makeList();
-                for unsigned long k = 0l; k < items.items.getSize(); k++ { mapped.push(fn(items.items.get(k), inner)); }
-                return mapped;
-            }
+        const long mapper = filterName.kind == TV_STRING ? tplFindRegistered(this.engine.filters, filterName.text) : -1l;
+        if mapper >= 0l {
+            f<TemplateValue>(const TemplateValue&, const TemplateArgs&) fn = this.engine.filters.get(cast<unsigned long>(mapper)).fn.get();
+            TemplateArgs inner;
+            for unsigned long k = 1l; k < args.positional.getSize(); k++ { inner.positional.pushBack(args.positional.get(k)); }
+            const TemplateValue items = tplIterable(input);
+            TemplateValue mapped;
+            mapped.makeList();
+            for unsigned long k = 0l; k < items.items.getSize(); k++ { mapped.push(fn(items.items.get(k), inner)); }
+            return mapped;
         }
     }
     TemplateValue out;
@@ -1667,8 +1636,8 @@ f<TemplateValue> TplRenderer.applyFilter(int t, int line, const String& name, co
 }
 
 f<TemplateValue> TplRenderer.evalBinary(int t, int line, const String& op, const TemplateValue& a, const TemplateValue& b) {
-    if op == "==" { return TemplateValue(tplEqual(a, b)); }
-    if op == "!=" { return TemplateValue(!tplEqual(a, b)); }
+    if op == "==" { return TemplateValue(a == b); }
+    if op == "!=" { return TemplateValue(a != b); }
     if op == "in" { return TemplateValue(tplContains(b, a)); }
     if op == "notin" { return TemplateValue(!tplContains(b, a)); }
     if op == "<" || op == "<=" || op == ">" || op == ">=" {
@@ -1690,7 +1659,7 @@ f<TemplateValue> TplRenderer.evalBinary(int t, int line, const String& op, const
             String right = b.toString();
             if this.autoescape && !(a.kind == TV_STRING && a.safe) { left = tplEscapeHtml(left); }
             if this.autoescape && !(b.kind == TV_STRING && b.safe) { right = tplEscapeHtml(right); }
-            return tplSafeValue(left + right);
+            return templateSafe(left + right);
         }
         return TemplateValue(a.toString() + b.toString());
     }
@@ -1755,18 +1724,13 @@ f<TemplateValue> TplRenderer.evalBinary(int t, int line, const String& op, const
             this.fail(t, line, "the exponent of ** must be an integer");
             return TemplateValue();
         }
-        long exponent = b.num;
-        const bool negative = exponent < 0l;
-        if negative { exponent = -exponent; }
-        if ints && !negative {
+        if ints && b.num >= 0l {
+            // Exact integer power
             long acc = 1l;
-            for long i = 0l; i < exponent; i++ { acc = acc * a.num; }
+            for long i = 0l; i < b.num; i++ { acc = acc * a.num; }
             return TemplateValue(acc);
         }
-        double acc = 1.0;
-        for long i = 0l; i < exponent; i++ { acc = acc * a.asDouble(); }
-        if negative { acc = 1.0 / acc; }
-        return TemplateValue(acc);
+        return TemplateValue(pow(a.asDouble(), cast<int>(b.num)));
     }
     this.fail(t, line, String("unknown operator ") + op);
     return TemplateValue();
@@ -1970,12 +1934,10 @@ f<TemplateValue> TplRenderer.evalCall(int t, int e, int line, int callee) {
             return this.invoke(t, line, fn, args, TemplateValue());
         }
         if calleeName == "super" { return this.renderSuper(t, line); }
-        for unsigned long i = 0l; i < this.engine.functions.getSize(); i++ {
-            TplFunctionEntry& entry = this.engine.functions.get(i);
-            if entry.name == calleeName {
-                f<TemplateValue>(const TemplateArgs&) fn = entry.fn.get();
-                return fn(args);
-            }
+        const long custom = tplFindRegistered(this.engine.functions, calleeName);
+        if custom >= 0l {
+            f<TemplateValue>(const TemplateArgs&) fn = this.engine.functions.get(cast<unsigned long>(custom)).fn.get();
+            return fn(args);
         }
         if calleeName == "range" {
             long start = 0l;
@@ -2072,11 +2034,7 @@ p TplRenderer.bindParams(int t, int line, int node, const TemplateArgs& args) {
     }
     for unsigned long i = params.getSize(); i < args.positional.getSize(); i++ { varargs.push(args.positional.get(i)); }
     for unsigned long i = 0l; i < args.names.getSize(); i++ {
-        bool known = false;
-        for unsigned long k = 0l; k < params.getSize(); k++ {
-            if params.get(k) == args.names.get(i) { known = true; break; }
-        }
-        if !known { kwargs.set(args.names.get(i), args.named.get(i)); }
+        if !algorithm::contains(params, args.names.get(i)) { kwargs.set(args.names.get(i), args.named.get(i)); }
     }
     this.define(String("varargs"), varargs);
     this.define(String("kwargs"), kwargs);
@@ -2117,7 +2075,7 @@ f<TemplateValue> TplRenderer.callMacro(int t, int line, const TemplateValue& mac
     this.base = savedBase;
     this.loopDepth = savedLoops;
     this.depth--;
-    return tplSafeValue(out);
+    return templateSafe(out);
 }
 
 f<TemplateValue> TplRenderer.callCaller(int t, int line, const TemplateValue& caller, const TemplateArgs& args) {
@@ -2143,7 +2101,7 @@ f<TemplateValue> TplRenderer.callCaller(int t, int line, const TemplateValue& ca
     this.base = savedBase;
     this.isolated = savedIsolated;
     this.depth--;
-    return tplSafeValue(out);
+    return templateSafe(out);
 }
 
 f<String> TplRenderer.macroName(int t, int node) {
@@ -2212,7 +2170,7 @@ f<TemplateValue> TplRenderer.renderSuper(int t, int line) {
     String out;
     this.renderBlockAt(current.name, pos, node, out);
     this.depth--;
-    return tplSafeValue(out);
+    return templateSafe(out);
 }
 
 // ----------------------------------------------------- Templates ----------------------------------------------------
@@ -2369,7 +2327,7 @@ p TplRenderer.bindTargets(int t, int line, const Vector<String>& targets, const 
         return;
     }
     if item.kind != TV_LIST {
-        this.fail(t, line, String("cannot unpack a ") + tplTypeName(item) + " into " + tplFormatLong(cast<long>(targets.getSize())) + " names");
+        this.fail(t, line, String("cannot unpack a ") + tplTypeName(item) + " into " + toString(cast<long>(targets.getSize())) + " names");
         return;
     }
     for unsigned long i = 0l; i < targets.getSize(); i++ { this.define(targets.get(i), item.at(i)); }
@@ -2505,7 +2463,7 @@ p TplRenderer.renderNode(int t, int nodeIdx, String& out) {
     } else if kind == TPL_ND_SET_BLOCK {
         String captured;
         this.renderNodes(t, body, captured);
-        TemplateValue value = tplSafeValue(captured);
+        TemplateValue value = templateSafe(captured);
         if expr >= 0 {
             this.pushFrame();
             this.define(String(TPL_BODY_NAME), value);
@@ -2591,7 +2549,7 @@ p TplRenderer.renderNode(int t, int nodeIdx, String& out) {
         String captured;
         this.renderNodes(t, body, captured);
         this.pushFrame();
-        this.define(String(TPL_BODY_NAME), tplSafeValue(captured));
+        this.define(String(TPL_BODY_NAME), templateSafe(captured));
         const TemplateValue value = this.eval(t, expr);
         this.popFrame();
         // The body was escaped when it was rendered
@@ -2633,13 +2591,13 @@ f<int> TemplateEngine.indexOf(const String& name) {
  * Add a template, or replace the one with the same name. Returns false if it has errors; they are described in
  * `lastError` and reported again when the template is rendered.
  */
-public f<bool> TemplateEngine.add(const String& name, const String& source) {
+public f<bool> TemplateEngine.add<Text, Source>(const Text& name, const Source& source) {
     TplTemplate tpl;
-    tpl.name = name;
-    tpl.compile(source, this.options());
+    tpl.name = String(name);
+    tpl.compile(String(source), this.options());
     const bool valid = tpl.error.isEmpty();
     if !valid { this.lastError = tpl.error; }
-    const int existing = this.indexOf(name);
+    const int existing = this.indexOf(tpl.name);
     if existing >= 0 {
         TplTemplate& slot = this.templates.get(cast<unsigned long>(existing));
         slot = tpl;
@@ -2649,24 +2607,16 @@ public f<bool> TemplateEngine.add(const String& name, const String& source) {
     return valid;
 }
 
-public f<bool> TemplateEngine.add(string name, string source) {
-    return this.add(String(name), String(source));
-}
-
-public f<bool> TemplateEngine.add(string name, const String& source) {
-    return this.add(String(name), source);
-}
-
 /**
  * Add a template from a file
  */
-public f<bool> TemplateEngine.addFile(string name, string path) {
+public f<bool> TemplateEngine.addFile<Text>(const Text& name, string path) {
     Result<String> content = readFile(path);
     if !content.isOk() {
         this.lastError = String("cannot read ") + path;
         return false;
     }
-    return this.add(String(name), content.unwrap());
+    return this.add(name, content.unwrap());
 }
 
 /**
@@ -2687,12 +2637,12 @@ public f<bool> TemplateEngine.loadDirectory(string path, string extension = ".ht
         if !entry.endsWith(extension) { continue; }
         const String full = String(path) + "/" + entry;
         if dirExists(full.getRaw()) { continue; }
-        if !this.addFile(entry.getRaw(), full.getRaw()) { allValid = false; }
+        if !this.addFile(entry, full.getRaw()) { allValid = false; }
     }
     return allValid;
 }
 
-public f<bool> TemplateEngine.has(string name) {
+public f<bool> TemplateEngine.has<Text>(const Text& name) {
     return this.indexOf(String(name)) >= 0;
 }
 
@@ -2712,7 +2662,7 @@ public f<Vector<String>> TemplateEngine.names() {
  * Register a filter: {{ value|name(args) }} calls fn(value, args). Replaces a built-in filter of the same name.
  */
 public p TemplateEngine.addFilter(string name, f<TemplateValue>(const TemplateValue&, const TemplateArgs&) fn) {
-    TplFilterEntry entry;
+    TplRegistered<f<TemplateValue>(const TemplateValue&, const TemplateArgs&)> entry;
     entry.name = String(name);
     entry.fn = Lambda<f<TemplateValue>(const TemplateValue&, const TemplateArgs&)>(fn);
     this.filters.pushBack(entry);
@@ -2722,7 +2672,7 @@ public p TemplateEngine.addFilter(string name, f<TemplateValue>(const TemplateVa
  * Register a function: {{ name(args) }} calls fn(args)
  */
 public p TemplateEngine.addFunction(string name, f<TemplateValue>(const TemplateArgs&) fn) {
-    TplFunctionEntry entry;
+    TplRegistered<f<TemplateValue>(const TemplateArgs&)> entry;
     entry.name = String(name);
     entry.fn = Lambda<f<TemplateValue>(const TemplateArgs&)>(fn);
     this.functions.pushBack(entry);
@@ -2731,7 +2681,7 @@ public p TemplateEngine.addFunction(string name, f<TemplateValue>(const Template
 /**
  * Make a value available to all templates. Data passed to render takes precedence.
  */
-public p TemplateEngine.addGlobal(string name, const TemplateValue& value) {
+public p TemplateEngine.addGlobal<Text>(const Text& name, const TemplateValue& value) {
     this.globals.set(name, value);
 }
 
@@ -2755,7 +2705,7 @@ f<Result<String>> TemplateEngine.renderIndex(int idx, const TemplateValue& data)
  * Render a template with the data (a map, whose keys are the variables). On failure, `lastError` tells what went
  * wrong and where.
  */
-public f<Result<String>> TemplateEngine.render(string name, const TemplateValue& data) {
+public f<Result<String>> TemplateEngine.render<Text>(const Text& name, const TemplateValue& data) {
     const int idx = this.indexOf(String(name));
     if idx < 0 {
         this.lastError = String("template '") + name + "' not found";
@@ -2767,7 +2717,7 @@ public f<Result<String>> TemplateEngine.render(string name, const TemplateValue&
 /**
  * Render a template without data
  */
-public f<Result<String>> TemplateEngine.render(string name) {
+public f<Result<String>> TemplateEngine.render<Text>(const Text& name) {
     const TemplateValue empty;
     return this.render(name, empty);
 }
@@ -2775,18 +2725,14 @@ public f<Result<String>> TemplateEngine.render(string name) {
 /**
  * Compile and render a template source once. It can include, import and extend the templates of the engine.
  */
-public f<Result<String>> TemplateEngine.renderString(const String& source, const TemplateValue& data) {
+public f<Result<String>> TemplateEngine.renderString<Source>(const Source& source, const TemplateValue& data) {
     TplTemplate tpl;
     tpl.name = String(TEMPLATE_STRING_NAME);
-    tpl.compile(source, this.options());
+    tpl.compile(String(source), this.options());
     this.templates.pushBack(tpl);
     Result<String> rendered = this.renderIndex(cast<int>(this.templates.getSize()) - 1, data);
     this.templates.popBack();
     return rendered;
-}
-
-public f<Result<String>> TemplateEngine.renderString(string source, const TemplateValue& data) {
-    return this.renderString(String(source), data);
 }
 
 /**
@@ -2809,7 +2755,7 @@ public f<String> TemplateEngine.check() {
             const TplExpr& target = tpl.exprs.get(cast<unsigned long>(node.expr));
             if target.kind != TPL_EX_LIT || target.litKind != TV_STRING { continue; }
             if this.indexOf(target.litText) < 0 {
-                report += tpl.name + ":" + tplFormatLong(cast<long>(node.line)) + ": refers to the unknown template '" + target.litText + "'\n";
+                report += tpl.name + ":" + toString(cast<long>(node.line)) + ": refers to the unknown template '" + target.litText + "'\n";
             }
         }
     }
@@ -2848,45 +2794,35 @@ public f<TemplateValue> templateNull() {
 /**
  * Markup that is trusted and output without escaping
  */
-public f<TemplateValue> templateSafe(const String& html) {
-    return tplSafeValue(html);
-}
-
-public f<TemplateValue> templateSafe(string html) {
-    return tplSafeValue(String(html));
+public f<TemplateValue> templateSafe<Text>(const Text& html) {
+    TemplateValue v = TemplateValue(html);
+    v.safe = true;
+    return v;
 }
 
 /**
  * Parse JSON into a value
  */
-public f<Result<TemplateValue>> templateJson(const String& json) {
+public f<Result<TemplateValue>> templateJson<Text>(const Text& json) {
     String problem;
-    const TemplateValue parsed = tplParseJson(json, problem);
+    const TemplateValue parsed = tplParseJson(String(json), problem);
     if !problem.isEmpty() { return err<TemplateValue>(Error("Invalid JSON")); }
     return ok(parsed);
-}
-
-public f<Result<TemplateValue>> templateJson(string json) {
-    return templateJson(String(json));
 }
 
 /**
  * Escape text for HTML
  */
-public f<String> templateEscape(const String& text) {
-    return tplEscapeHtml(text);
+public f<String> templateEscape<Text>(const Text& text) {
+    return tplEscapeHtml(String(text));
 }
 
 /**
  * Render a template source once with the default settings. Templates rendered this way cannot include others.
  */
-public f<Result<String>> templateRender(const String& source, const TemplateValue& data) {
+public f<Result<String>> templateRender<Source>(const Source& source, const TemplateValue& data) {
     TemplateEngine engine;
     return engine.renderString(source, data);
-}
-
-public f<Result<String>> templateRender(string source, const TemplateValue& data) {
-    return templateRender(String(source), data);
 }
 
 // ======================================================= Tests =======================================================
@@ -2923,11 +2859,11 @@ f<bool> testValueComparison() {
     assert tplCompare(TemplateValue("b"), TemplateValue("a"), ok) > 0 && ok;
     tplCompare(TemplateValue("1"), TemplateValue(1), ok);
     assert !ok;
-    assert tplEqual(TemplateValue(2), TemplateValue(2.0));
-    assert !tplEqual(TemplateValue("2"), TemplateValue(2));
+    assert TemplateValue(2) == TemplateValue(2.0);
+    assert TemplateValue("2") != TemplateValue(2);
     TemplateValue none;
     none.kind = TV_NULL;
-    assert tplEqual(none, TemplateValue());
+    assert none == TemplateValue();
     assert !TemplateValue(0).truthy() && TemplateValue("x").truthy() && !TemplateValue("").truthy();
     return true;
 }
@@ -3261,7 +3197,7 @@ f<bool> testCustomFiltersAndFunctions() {
     TemplateEngine engine;
     engine.addFilter("shout", f<TemplateValue>(const TemplateValue& v, const TemplateArgs& args) {
         const TemplateValue times = args.get(0l, "times");
-        String out = tplUpper(v.toString());
+        String out = toUpper(v.toString());
         for long i = 0l; i < times.asLong(); i++ { out += "!"; }
         return TemplateValue(out);
     });

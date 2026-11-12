@@ -1,5 +1,9 @@
 // Std imports
+import "std/data/algorithm";
 import "std/data/vector";
+import "std/text/analysis";
+import "std/text/string-ext";
+import "std/type/type-conversion";
 
 // Own imports
 import "./text";
@@ -64,6 +68,9 @@ public const int TPL_ND_AUTOESCAPE = 15;   // expr, body
 public const int TPL_ND_BREAK = 16;
 public const int TPL_ND_CONTINUE = 17;
 public const int TPL_ND_DO = 18;           // expr
+
+// Text arguments: a raw string or a String
+type Text string|String;
 
 // Name of the variable that holds the body of a {% filter %} block. It cannot be written in a template.
 public const string TPL_BODY_NAME = "(body)";
@@ -151,19 +158,11 @@ public type TplParser struct {
 
 // ------------------------------------------------------ Helpers -----------------------------------------------------
 
+/**
+ * Whether the word is in a space separated list of words
+ */
 f<bool> tplWordIn(const String& word, string list) {
-    // `list` is a space separated list of words
-    const String all = String(list);
-    unsigned long start = 0l;
-    const unsigned long len = all.getLength();
-    while start < len {
-        long stop = all.find(' ', start);
-        if stop < 0l { stop = cast<long>(len); }
-        const String candidate = all.getSubstring(start, stop - cast<long>(start));
-        if candidate == word { return true; }
-        start = cast<unsigned long>(stop) + 1l;
-    }
-    return false;
+    return contains(split(String(list), ' '), word);
 }
 
 f<int> tplCountLines(const String& text, unsigned long from, unsigned long to) {
@@ -178,13 +177,12 @@ f<bool> tplIsKeyword(const String& word) {
     return tplWordIn(word, "and or not in is if else");
 }
 
-p TplTemplate.fail(int line, const String& message) {
+/**
+ * Record the first problem, "name:line: message"
+ */
+p TplTemplate.fail<Text>(int line, const Text& message) {
     if !this.error.isEmpty() { return; }
-    this.error = this.name + ":" + tplFormatLong(cast<long>(line)) + ": " + message;
-}
-
-p TplTemplate.fail(int line, string message) {
-    this.fail(line, String(message));
+    this.error = this.name + ":" + toString(line) + ": " + message;
 }
 
 f<int> TplTemplate.addExpr(const TplExpr& e) {
@@ -237,10 +235,10 @@ f<bool> tplFindEndRaw(const String& src, unsigned long from, unsigned long& tagS
         trimLeft = false;
         trimRight = false;
         if i < len && (src[i] == '-' || src[i] == '+') { trimLeft = src[i] == '-'; i++; }
-        while i < len && tplIsSpace(src[i]) { i++; }
+        while i < len && isWhitespace(src[i]) { i++; }
         if i + 6l <= len && src.getSubstring(i, 6l) == "endraw" {
             i += 6l;
-            while i < len && tplIsSpace(src[i]) { i++; }
+            while i < len && isWhitespace(src[i]) { i++; }
             if i < len && src[i] == '-' { trimRight = true; i++; }
             if i + 1l < len && src[i] == '%' && src[i + 1l] == '}' {
                 tagStart = cast<unsigned long>(found);
@@ -257,18 +255,6 @@ f<bool> tplIsTag(const TplChunk& chunk) {
     return chunk.kind != TPL_CH_TEXT && chunk.kind != TPL_CH_VERBATIM;
 }
 
-f<String> tplRstrip(const String& text) {
-    long end = cast<long>(text.getLength());
-    while end > 0l && tplIsSpace(text[cast<unsigned long>(end - 1l)]) { end--; }
-    return text.getSubstring(0l, end);
-}
-
-f<String> tplLstrip(const String& text) {
-    unsigned long start = 0l;
-    while start < text.getLength() && tplIsSpace(text[start]) { start++; }
-    return text.getSubstring(start);
-}
-
 /**
  * Remove runs of whitespace with a line break that sit between markup ('>' or a tag) and markup ('<' or a tag)
  */
@@ -278,10 +264,10 @@ f<String> tplStripIndentation(const String& text) {
     unsigned long i = 0l;
     while i < len {
         const char c = text[i];
-        if !tplIsSpace(c) { kept.append(c); i++; continue; }
+        if !isWhitespace(c) { kept.append(c); i++; continue; }
         unsigned long stop = i;
         bool lineBreak = false;
-        while stop < len && tplIsSpace(text[stop]) {
+        while stop < len && isWhitespace(text[stop]) {
             if text[stop] == '\n' { lineBreak = true; }
             stop++;
         }
@@ -434,30 +420,30 @@ f<bool> tplTokenize(const String& src, int firstLine, Vector<TplToken>& out, Str
     while i < len {
         const char c = src[i];
         if c == '\n' { line++; i++; continue; }
-        if tplIsSpace(c) { i++; continue; }
+        if isWhitespace(c) { i++; continue; }
         TplToken tok;
         tok.line = line;
-        if tplIsAlpha(c) {
+        if isAlphaUnderscore(c) {
             const unsigned long start = i;
-            while i < len && (tplIsAlpha(src[i]) || tplIsDigit(src[i])) { i++; }
+            while i < len && (isAlphaNumUnderscore(src[i])) { i++; }
             tok.kind = TPL_TK_NAME;
             tok.text = src.getSubstring(start, cast<long>(i - start));
-        } else if tplIsDigit(c) {
+        } else if isDigit(c) {
             const unsigned long start = i;
             tok.kind = TPL_TK_INT;
-            while i < len && tplIsDigit(src[i]) { i++; }
-            if i + 1l < len && src[i] == '.' && tplIsDigit(src[i + 1l]) {
+            while i < len && isDigit(src[i]) { i++; }
+            if i + 1l < len && src[i] == '.' && isDigit(src[i + 1l]) {
                 tok.kind = TPL_TK_FLOAT;
                 i++;
-                while i < len && tplIsDigit(src[i]) { i++; }
+                while i < len && isDigit(src[i]) { i++; }
             }
             if i < len && (src[i] == 'e' || src[i] == 'E') {
                 unsigned long k = i + 1l;
                 if k < len && (src[k] == '-' || src[k] == '+') { k++; }
-                if k < len && tplIsDigit(src[k]) {
+                if k < len && isDigit(src[k]) {
                     tok.kind = TPL_TK_FLOAT;
                     i = k;
-                    while i < len && tplIsDigit(src[i]) { i++; }
+                    while i < len && isDigit(src[i]) { i++; }
                 }
             }
             tok.text = src.getSubstring(start, cast<long>(i - start));

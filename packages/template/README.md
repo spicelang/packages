@@ -77,11 +77,11 @@ Result<TemplateValue> parsed = templateJson("{\"posts\": [{\"title\": \"Hello\"}
 
 | Method                                                | Purpose                                                    |
 |-------------------------------------------------------|------------------------------------------------------------|
-| `TemplateValue(x)`                                    | From `bool`, `int`, `long`, `double`, `string` or `String` |
+| `TemplateValue(x)`                                    | From `bool`, `short`, `int`, `long`, `double`, `string` or `String` |
 | `templateList()`, `templateMap()`, `templateNull()`   | Empty list, empty map, null                                |
 | `templateSafe(html)`                                  | A string that is output without escaping                   |
 | `templateJson(json)`                                  | Parse JSON (`Result`, error if it is invalid)              |
-| `set(key, value)`, `remove(key)`, `push(value)`       | Build maps and lists                                       |
+| `set(key, value)`, `remove(key)`, `push(value)`       | Build maps and lists; values can be a `TemplateValue` or anything `TemplateValue(x)` takes |
 | `get(key)`, `at(index)`, `has(key)`, `size()`         | Read (missing entries are undefined)                       |
 | `isUndefined()`, `isNull()`, `isString()`, `isMap()`… | Kind checks                                                |
 | `truthy()`, `asLong()`, `asDouble()`, `toString()`    | Conversions                                                |
@@ -109,7 +109,7 @@ Result<TemplateValue> parsed = templateJson("{\"posts\": [{\"title\": \"Hello\"}
 | `lastError`                            | `name:line: message` of the last failure                                       |
 
 `templateRender(source, data)` renders a single source with default settings, and `templateEscape(text)` escapes text
-for HTML.
+for HTML. Wherever the API takes a name, key, source or text, both `string` literals and `String`s work.
 
 Custom filters and functions get their arguments as `TemplateArgs`: `args.get(index, "name")` returns the positional
 argument at `index` or the keyword argument `name` (undefined if neither is given), `args.at(i)`, `args.byName(n)` and

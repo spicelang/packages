@@ -1375,6 +1375,7 @@ public type TemplateEngine struct {
     public bool trimBlocks = false         // Remove the first line break after a block tag (applies to templates added later)
     public bool lstripBlocks = false       // Remove the indentation before a block tag (applies to templates added later)
     public bool stripIndentation = false   // Remove whitespace with line breaks between markup (applies to templates added later)
+    public bool lazyCompile = false        // Compile a template when it is first needed, not in add() (applies to templates added later)
     public int maxDepth = 64               // Maximum nesting of includes, macro calls and inheritance
     public String lastError                // Description of the last problem, "name:line: message"
     public TemplateValue globals           // Values every template can read
@@ -1461,11 +1462,7 @@ f<bool> TplRenderer.ok() {
 }
 
 f<int> TplRenderer.findTemplate(const String& name) {
-    for unsigned long i = 0l; i < this.engine.templates.getSize(); i++ {
-        const TplTemplate& tpl = this.engine.templates.get(i);
-        if tpl.name == name { return cast<int>(i); }
-    }
-    return -1;
+    return this.engine.lookup(name);
 }
 
 p TplRenderer.define(const String& name, const TemplateValue& value) {
@@ -2588,15 +2585,46 @@ f<int> TemplateEngine.indexOf(const String& name) {
 }
 
 /**
+ * Compile a template that was added with lazy compilation, if that has not happened yet. The template is replaced in
+ * place; the list of templates does not change, so references to other templates stay valid during a render.
+ */
+p TemplateEngine.prepare(int idx) {
+    TplTemplate& slot = this.templates.get(cast<unsigned long>(idx));
+    if !slot.deferred { return; }
+    TplTemplate tpl;
+    tpl.name = slot.name;
+    tpl.compile(slot.source, slot.options);
+    slot = tpl;
+}
+
+/**
+ * Index of the template with the name, compiled and ready to render, or -1
+ */
+f<int> TemplateEngine.lookup(const String& name) {
+    const int idx = this.indexOf(name);
+    if idx >= 0 { this.prepare(idx); }
+    return idx;
+}
+
+/**
  * Add a template, or replace the one with the same name. Returns false if it has errors; they are described in
- * `lastError` and reported again when the template is rendered.
+ * `lastError` and reported again when the template is rendered. With `lazyCompile`, the template is only stored and
+ * compiled when it is first rendered, included, imported or extended, so add() cannot see its errors and returns true;
+ * check() still reports them.
  */
 public f<bool> TemplateEngine.add<Text, Source>(const Text& name, const Source& source) {
     TplTemplate tpl;
     tpl.name = String(name);
-    tpl.compile(String(source), this.options());
-    const bool valid = tpl.error.isEmpty();
-    if !valid { this.lastError = tpl.error; }
+    bool valid = true;
+    if this.lazyCompile {
+        tpl.deferred = true;
+        tpl.source = String(source);
+        tpl.options = this.options();
+    } else {
+        tpl.compile(String(source), this.options());
+        valid = tpl.error.isEmpty();
+        if !valid { this.lastError = tpl.error; }
+    }
     const int existing = this.indexOf(tpl.name);
     if existing >= 0 {
         TplTemplate& slot = this.templates.get(cast<unsigned long>(existing));
@@ -2706,7 +2734,7 @@ f<Result<String>> TemplateEngine.renderIndex(int idx, const TemplateValue& data)
  * wrong and where.
  */
 public f<Result<String>> TemplateEngine.render<Text>(const Text& name, const TemplateValue& data) {
-    const int idx = this.indexOf(String(name));
+    const int idx = this.lookup(String(name));
     if idx < 0 {
         this.lastError = String("template '") + name + "' not found";
         return err<String>(Error(TEMPLATE_ERROR_MESSAGE));
@@ -2741,6 +2769,7 @@ public f<Result<String>> TemplateEngine.renderString<Source>(const Source& sourc
  */
 public f<String> TemplateEngine.check() {
     String report;
+    for unsigned long i = 0l; i < this.templates.getSize(); i++ { this.prepare(cast<int>(i)); }
     for unsigned long i = 0l; i < this.templates.getSize(); i++ {
         const TplTemplate& tpl = this.templates.get(i);
         if !tpl.error.isEmpty() {
@@ -3225,6 +3254,46 @@ f<bool> testErrorsAndCheck() {
     assert engine.lastError.contains("never closed");
     Result<String> missing = engine.render("nope.html");
     assert !missing.isOk() && engine.lastError == "template 'nope.html' not found";
+    return true;
+}
+
+#[test]
+f<bool> testLazyCompile() {
+    TemplateEngine engine;
+    engine.lazyCompile = true;
+    engine.stripIndentation = true;  // Options in effect at add() apply, also when compiled later
+    assert engine.add("base.html", "<h1>\n  {% block title %}Base{% endblock %}\n</h1>{% block body %}{% endblock %}");
+    assert engine.add("card.html", "<p>{{ item }}</p>");
+    assert engine.add("macros.html", "{% macro tag(t) %}[{{ t }}]{% endmacro %}");
+    assert engine.add("page.html", "{% extends \"base.html\" %}{% import \"macros.html\" as m %}{% block title %}Page{% endblock %}" +
+                      String("{% block body %}{% for item in items %}{% include \"card.html\" %}{% endfor %}{{ m.tag(\"x\") }}{% include name %}{% endblock %}"));
+    assert engine.add("dynamic.html", "dyn");
+    assert engine.add("unused.html", "{{ never");
+    engine.stripIndentation = false;
+    // Nothing is compiled before it is needed
+    for unsigned long i = 0l; i < engine.templates.getSize(); i++ { assert engine.templates.get(i).deferred; }
+    assert tplTestRenderName(engine, "page.html", "{\"items\": [1, 2], \"name\": \"dynamic.html\"}") == "<h1>Page</h1><p>1</p><p>2</p>[x]dyn";
+    // Only the templates the render reached were compiled; a broken template that is never used costs nothing
+    for unsigned long i = 0l; i < engine.templates.getSize(); i++ {
+        const TplTemplate& tpl = engine.templates.get(i);
+        assert tpl.deferred == (tpl.name == "unused.html");
+    }
+    // Errors show up when the template is rendered, and in check(), which compiles everything
+    Result<String> broken = engine.render("unused.html");
+    assert !broken.isOk() && engine.lastError.contains("unused.html:1:");
+    assert engine.add("late.html", "{% if x %}open");
+    const String report = engine.check();
+    assert report.contains("unused.html:1:") && report.contains("late.html:1: 'if' block is never closed");
+    // Replacing a template that was not compiled yet
+    assert engine.add("card.html", "<i>{{ item }}</i>");
+    assert tplTestRenderName(engine, "page.html", "{\"items\": [3], \"name\": \"dynamic.html\"}") == "<h1>Page</h1><i>3</i>[x]dyn";
+    // renderString can include templates that are not compiled yet
+    TemplateEngine other;
+    other.lazyCompile = true;
+    assert other.add("part.html", "({{ v }})");
+    const TemplateValue partData = tplTestData("{\"v\": 1}");
+    Result<String> once = other.renderString("a{% include \"part.html\" %}b", partData);
+    assert once.isOk() && once.unwrap() == "a(1)b";
     return true;
 }
 

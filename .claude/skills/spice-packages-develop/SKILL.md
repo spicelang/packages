@@ -38,7 +38,7 @@ entry = "<name>.spice"          # CI tests this file
 
 Users import the entry file without the extension: `import "spice_packages/<name>/<name>";`.
 
-## Binding packages (gtk4, libcurl, sqlite)
+## Binding packages (gtk4, libcurl, llvm, sqlite)
 
 Bindings declare the C functions with `ext f<…> name(…);` and wrap them in Spice types. They link the system library
 through module attributes at the top of the entry file:
@@ -97,6 +97,10 @@ for m in packages/*/spice.toml; do d=$(dirname "$m"); e=$(sed -n 's/^entry *= *"
 Binding packages need the system libraries installed to link (`libgtk-4-dev libcurl4-openssl-dev libsqlite3-dev` on
 Debian/Ubuntu). Since CI uses the latest release, a package may only use std APIs and language features that are
 released; if a change needs an unreleased compiler, it has to wait for the next Spice release.
+
+The `llvm` package links a static LLVM build (the version of the Spice compiler, see its README) through the
+`LLVM_LIB_DIR` and `LLVM_INCLUDE_DIRS` variables. CI tests it in the separate `test-llvm` job, which builds LLVM with the
+`setup-llvm` action of the Spice repository, and the main test loop skips it.
 
 CI does not install package dependencies. A package with a non-empty `[dependencies]` table needs that step added to
 the workflow (e.g. `spice-shaker sync` in its directory) first.

@@ -1,0 +1,509 @@
+// Std imports
+import "std/data/vector";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Text helpers of the template engine: number formatting and parsing, escaping, case conversion and the string
+// operations behind the filters. They work on plain Strings, so the parser and the engine can share them.
+// ---------------------------------------------------------------------------------------------------------------------
+
+ext f<int> snprintf(char*, unsigned long, string, ...);
+ext f<double> strtod(string, char**);
+
+
+// Kinds of values
+public const int TV_UNDEFINED = 0; // Missing variable or attribute. Renders as nothing, is false
+public const int TV_NULL = 1;
+public const int TV_BOOL = 2;
+public const int TV_INT = 3;
+public const int TV_FLOAT = 4;
+public const int TV_STRING = 5;
+public const int TV_LIST = 6;
+public const int TV_MAP = 7;
+public const int TV_MACRO = 8;     // A macro of a template (internal)
+public const int TV_CALLER = 9;    // The body of a {% call %} block, callable as caller() (internal)
+
+public const string TPL_HEX_DIGITS = "0123456789ABCDEF";
+
+
+
+// ------------------------------------------------------ Numbers -----------------------------------------------------
+
+// ------------------------------------------------------ Helpers -----------------------------------------------------
+
+public f<String> tplFormatLong(long value) {
+    if value == 0l { return String("0"); }
+    // The digits are collected backwards; the smallest long has no positive counterpart, so work with negative numbers
+    const bool negative = value < 0l;
+    long rest = negative ? value : -value;
+    String digits;
+    while rest != 0l {
+        const long digit = -(rest % 10l);
+        digits.append(cast<char>(48l + digit));
+        rest = rest / 10l;
+    }
+    if negative { digits.append('-'); }
+    digits.reverse();
+    return digits;
+}
+
+/**
+ * Shortest readable form of a float: 2.5, 2.0, 1e+20
+ */
+public f<String> tplFormatDouble(double value) {
+    String out;
+    unsafe {
+        const int length = snprintf(nil<char*>, 0l, "%.15g", value);
+        if length <= 0 { return String("0.0"); }
+        out = String(length);
+        snprintf(cast<char*>(out.getRaw()), cast<unsigned long>(length + 1), "%.15g", value);
+    }
+    bool plain = true;
+    for unsigned long i = 0l; i < out.getLength(); i++ {
+        const char c = out[i];
+        if c == '.' || c == 'e' || c == 'n' || c == 'i' { plain = false; }
+    }
+    if plain { out += ".0"; }
+    return out;
+}
+
+/**
+ * Format a float with a fixed number of decimal places
+ */
+public f<String> tplFormatFixed(double value, int decimals) {
+    String out;
+    unsafe {
+        const int length = snprintf(nil<char*>, 0l, "%.*f", decimals, value);
+        if length <= 0 { return String("0"); }
+        out = String(length);
+        snprintf(cast<char*>(out.getRaw()), cast<unsigned long>(length + 1), "%.*f", decimals, value);
+    }
+    return out;
+}
+
+/**
+ * Parse an integer or a float. Returns TV_INT (in `num`), TV_FLOAT (in `real`) or TV_UNDEFINED if the text is not a
+ * number. Integers that do not fit into a long become floats.
+ */
+public f<int> tplScanNumber(const String& input, long& num, double& real) {
+    const String text = input.trim();
+    const unsigned long len = text.getLength();
+    if len == 0l { return TV_UNDEFINED; }
+    unsigned long i = 0l;
+    if text[0l] == '-' || text[0l] == '+' { i = 1l; }
+    if i == len { return TV_UNDEFINED; }
+    bool digits = false;
+    bool isFloat = false;
+    while i < len && text[i] >= '0' && text[i] <= '9' { i++; digits = true; }
+    if i < len && text[i] == '.' {
+        isFloat = true;
+        i++;
+        while i < len && text[i] >= '0' && text[i] <= '9' { i++; digits = true; }
+    }
+    if !digits { return TV_UNDEFINED; }
+    if i < len && (text[i] == 'e' || text[i] == 'E') {
+        isFloat = true;
+        i++;
+        if i < len && (text[i] == '-' || text[i] == '+') { i++; }
+        bool expDigits = false;
+        while i < len && text[i] >= '0' && text[i] <= '9' { i++; expDigits = true; }
+        if !expDigits { return TV_UNDEFINED; }
+    }
+    if i != len { return TV_UNDEFINED; }
+    if isFloat {
+        unsafe { real = strtod(text.getRaw(), nil<char**>); }
+        return TV_FLOAT;
+    }
+    // Accumulate negatively to cover the whole range; fall back to a float on overflow
+    long acc = 0l;
+    unsigned long k = 0l;
+    if text[0l] == '-' || text[0l] == '+' { k = 1l; }
+    while k < len {
+        const long digit = cast<long>(cast<int>(text[k])) - 48l;
+        k++;
+        // acc * 10 - digit must not go below the smallest long, -9223372036854775808
+        if acc < -922337203685477580l || (acc == -922337203685477580l && digit > 8l) {
+            unsafe { real = strtod(text.getRaw(), nil<char**>); }
+            return TV_FLOAT;
+        }
+        acc = acc * 10l - digit;
+    }
+    if text[0l] != '-' {
+        if acc == -9223372036854775807l - 1l {
+            real = 9223372036854775807.0 + 1.0;
+            return TV_FLOAT;
+        }
+        acc = -acc;
+    }
+    num = acc;
+    return TV_INT;
+}
+
+// ------------------------------------------------------- Text -------------------------------------------------------
+
+public f<bool> tplIsSpace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+public f<bool> tplIsDigit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+public f<bool> tplIsAlpha(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+/**
+ * Escape the characters that have a meaning in HTML: & < > " '
+ */
+public f<String> tplEscapeHtml(const String& input) {
+    String acc;
+    const unsigned long len = input.getLength();
+    for unsigned long i = 0l; i < len; i++ {
+        const char c = input[i];
+        if c == '&' { acc += "&amp;"; }
+        else if c == '<' { acc += "&lt;"; }
+        else if c == '>' { acc += "&gt;"; }
+        else if c == '"' { acc += "&quot;"; }
+        else if c == '\'' { acc += "&#39;"; }
+        else { acc.append(c); }
+    }
+    return acc;
+}
+
+/**
+ * Percent-encode everything except the unreserved characters of RFC 3986. With `keepSlash`, '/' stays as well.
+ */
+public f<String> tplUrlEncode(const String& input, bool keepSlash = false) {
+    String acc;
+    const unsigned long len = input.getLength();
+    for unsigned long i = 0l; i < len; i++ {
+        const char c = input[i];
+        const bool plain = tplIsAlpha(c) || tplIsDigit(c) || c == '-' || c == '.' || c == '~' || (keepSlash && c == '/');
+        if plain {
+            acc.append(c);
+        } else {
+            const int code = cast<int>(c) & 255;
+            acc.append('%');
+            acc.append(TPL_HEX_DIGITS[code / 16]);
+            acc.append(TPL_HEX_DIGITS[code % 16]);
+        }
+    }
+    return acc;
+}
+
+public f<String> tplLower(const String& input) {
+    String acc;
+    for unsigned long i = 0l; i < input.getLength(); i++ {
+        char c = input[i];
+        if c >= 'A' && c <= 'Z' { c = cast<char>(cast<int>(c) + 32); }
+        acc.append(c);
+    }
+    return acc;
+}
+
+public f<String> tplUpper(const String& input) {
+    String acc;
+    for unsigned long i = 0l; i < input.getLength(); i++ {
+        char c = input[i];
+        if c >= 'a' && c <= 'z' { c = cast<char>(cast<int>(c) - 32); }
+        acc.append(c);
+    }
+    return acc;
+}
+
+/**
+ * Compare two strings byte-wise: negative, 0 or positive
+ */
+public f<int> tplCompareText(const String& a, const String& b) {
+    const unsigned long la = a.getLength();
+    const unsigned long lb = b.getLength();
+    const unsigned long n = la < lb ? la : lb;
+    for unsigned long i = 0l; i < n; i++ {
+        const int ca = cast<int>(a[i]) & 255;
+        const int cb = cast<int>(b[i]) & 255;
+        if ca != cb { return ca < cb ? -1 : 1; }
+    }
+    if la == lb { return 0; }
+    return la < lb ? -1 : 1;
+}
+
+public p tplAppendUtf8(String& out, long code) {
+    if code < 0x80l {
+        out.append(cast<char>(code));
+    } else if code < 0x800l {
+        out.append(cast<char>(0xC0l | (code >> 6l)));
+        out.append(cast<char>(0x80l | (code & 0x3Fl)));
+    } else if code < 0x10000l {
+        out.append(cast<char>(0xE0l | (code >> 12l)));
+        out.append(cast<char>(0x80l | ((code >> 6l) & 0x3Fl)));
+        out.append(cast<char>(0x80l | (code & 0x3Fl)));
+    } else {
+        out.append(cast<char>(0xF0l | (code >> 18l)));
+        out.append(cast<char>(0x80l | ((code >> 12l) & 0x3Fl)));
+        out.append(cast<char>(0x80l | ((code >> 6l) & 0x3Fl)));
+        out.append(cast<char>(0x80l | (code & 0x3Fl)));
+    }
+}
+
+/**
+ * Split UTF-8 text into characters (code points)
+ */
+public f<Vector<String>> tplChars(const String& text) {
+    Vector<String> chars;
+    const unsigned long len = text.getLength();
+    unsigned long i = 0l;
+    while i < len {
+        String ch;
+        ch.append(text[i]);
+        i++;
+        while i < len && (cast<int>(text[i]) & 0xC0) == 0x80 {
+            ch.append(text[i]);
+            i++;
+        }
+        chars.pushBack(ch);
+    }
+    return chars;
+}
+
+public f<unsigned long> tplCharCount(const String& text) {
+    unsigned long n = 0l;
+    for unsigned long i = 0l; i < text.getLength(); i++ {
+        if (cast<int>(text[i]) & 0xC0) != 0x80 { n++; }
+    }
+    return n;
+}
+
+public f<String> tplCapitalize(const String& text) {
+    const String lowered = tplLower(text);
+    if lowered.isEmpty() { return lowered; }
+    String out = lowered;
+    const char c = out[0l];
+    if c >= 'a' && c <= 'z' {
+        char& first = out[0l];
+        first = cast<char>(cast<int>(c) - 32);
+    }
+    return out;
+}
+
+public f<String> tplTitle(const String& text) {
+    String out;
+    bool startOfWord = true;
+    for unsigned long i = 0l; i < text.getLength(); i++ {
+        char c = text[i];
+        const bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        if letter {
+            if startOfWord && c >= 'a' && c <= 'z' { c = cast<char>(cast<int>(c) - 32); }
+            else if !startOfWord && c >= 'A' && c <= 'Z' { c = cast<char>(cast<int>(c) + 32); }
+            startOfWord = false;
+        } else {
+            // Word boundaries like Jinja's title filter
+            startOfWord = tplIsSpace(c) || c == '-' || c == '(' || c == '[' || c == '{' || c == '<';
+        }
+        out.append(c);
+    }
+    return out;
+}
+
+public f<String> tplTrimChars(const String& text, const String& chars) {
+    if chars.isEmpty() { return text.trim(); }
+    unsigned long start = 0l;
+    long stop = cast<long>(text.getLength());
+    while start < text.getLength() && chars.find(text[start]) >= 0l { start++; }
+    while stop > cast<long>(start) && chars.find(text[cast<unsigned long>(stop - 1l)]) >= 0l { stop--; }
+    return text.getSubstring(start, stop - cast<long>(start));
+}
+
+/**
+ * Replace occurrences of `old` with `new`, at most `limit` times (all if negative)
+ */
+public f<String> tplReplace(const String& text, const String& old, const String& replacement, long limit) {
+    if old.isEmpty() { return text; }
+    String out;
+    unsigned long pos = 0l;
+    long done = 0l;
+    while limit < 0l || done < limit {
+        const long found = text.find(old.getRaw(), pos);
+        if found < 0l { break; }
+        out += text.getSubstring(pos, found - cast<long>(pos));
+        out += replacement;
+        pos = cast<unsigned long>(found) + old.getLength();
+        done++;
+    }
+    out += text.getSubstring(pos);
+    return out;
+}
+
+/**
+ * Split text at a separator, or at runs of whitespace if the separator is empty
+ */
+public f<Vector<String>> tplSplit(const String& text, const String& separator) {
+    Vector<String> parts;
+    if separator.isEmpty() {
+        String current;
+        for unsigned long i = 0l; i < text.getLength(); i++ {
+            const char c = text[i];
+            if tplIsSpace(c) {
+                if !current.isEmpty() { parts.pushBack(current); current = String(""); }
+            } else {
+                current.append(c);
+            }
+        }
+        if !current.isEmpty() { parts.pushBack(current); }
+        return parts;
+    }
+    if text.isEmpty() { return parts; }
+    unsigned long start = 0l;
+    while true {
+        const long found = text.find(separator.getRaw(), start);
+        if found < 0l { break; }
+        parts.pushBack(text.getSubstring(start, found - cast<long>(start)));
+        start = cast<unsigned long>(found) + separator.getLength();
+    }
+    parts.pushBack(text.getSubstring(start));
+    return parts;
+}
+
+public f<String> tplStripTags(const String& text) {
+    String plain;
+    bool inTag = false;
+    for unsigned long i = 0l; i < text.getLength(); i++ {
+        const char c = text[i];
+        if c == '<' { inTag = true; plain.append(' '); continue; }
+        if c == '>' && inTag { inTag = false; continue; }
+        if !inTag { plain.append(c); }
+    }
+    // Collapse whitespace
+    const Vector<String> words = tplSplit(plain, String(""));
+    String out;
+    for unsigned long i = 0l; i < words.getSize(); i++ {
+        if i > 0l { out.append(' '); }
+        out += words.get(i);
+    }
+    return out;
+}
+
+public f<String> tplTruncate(const String& text, long length, bool killWords, const String& end, long leeway) {
+    const Vector<String> chars = tplChars(text);
+    if cast<long>(chars.getSize()) <= length + leeway { return text; }
+    long keep = length - cast<long>(tplCharCount(end));
+    if keep < 0l { keep = 0l; }
+    String cut;
+    for long i = 0l; i < keep; i++ { cut += chars.get(cast<unsigned long>(i)); }
+    const bool midWord = keep < cast<long>(chars.getSize()) && !tplIsSpace(chars.get(cast<unsigned long>(keep))[0l]);
+    if !killWords && midWord {
+        // Drop the partial last word
+        const long space = cut.rfind(" ");
+        if space > 0l { cut = cut.getSubstring(0l, space); }
+    }
+    return tplRstrip2(cut) + end;
+}
+
+public f<String> tplRstrip2(const String& text) {
+    long stop = cast<long>(text.getLength());
+    while stop > 0l && tplIsSpace(text[cast<unsigned long>(stop - 1l)]) { stop--; }
+    return text.getSubstring(0l, stop);
+}
+
+public f<String> tplIndent(const String& text, const String& pad, bool first, bool blank) {
+    const Vector<String> lines = tplSplit(text, String("\n"));
+    String out;
+    for unsigned long i = 0l; i < lines.getSize(); i++ {
+        if i > 0l { out.append('\n'); }
+        const String line = lines.get(i);
+        const bool isBlank = line.trim().isEmpty();
+        if (i > 0l || first) && (blank || !isBlank) { out += pad; }
+        out += line;
+    }
+    return out;
+}
+
+/**
+ * 12345 -> 12,345
+ */
+public f<String> tplThousands(long value, const String& separator) {
+    const String raw = tplFormatLong(value);
+    String acc;
+    const unsigned long len = raw.getLength();
+    for unsigned long i = 0l; i < len; i++ {
+        if i > 0l && (len - i) % 3l == 0l && raw[i - 1l] != '-' { acc += separator; }
+        acc.append(raw[i]);
+    }
+    return acc;
+}
+
+public f<String> tplFileSize(double bytes, bool binary) {
+    const double base = binary ? 1024.0 : 1000.0;
+    if bytes < base {
+        const long whole = cast<long>(bytes);
+        return tplFormatLong(whole) + (whole == 1l ? " Byte" : " Bytes");
+    }
+    const string unitsDecimal = "kB MB GB TB PB EB ZB YB";
+    const string unitsBinary = "KiB MiB GiB TiB PiB EiB ZiB YiB";
+    const Vector<String> units = tplSplit(String(binary ? unitsBinary : unitsDecimal), String(" "));
+    double value = bytes / base;
+    unsigned long unit = 0l;
+    while value >= base && unit + 1l < units.getSize() {
+        value = value / base;
+        unit++;
+    }
+    return tplFormatFixed(value, 1) + " " + units.get(unit);
+}
+
+public f<double> tplRound(double value, int precision, const String& method) {
+    double factor = 1.0;
+    for int i = 0; i < precision; i++ { factor = factor * 10.0; }
+    const double scaled = value * factor;
+    long whole = cast<long>(scaled);
+    const double frac = scaled - cast<double>(whole);
+    if method == "floor" {
+        if frac < 0.0 { whole--; }
+    } else if method == "ceil" {
+        if frac > 0.0 { whole++; }
+    } else {
+        if frac >= 0.5 { whole++; }
+        else if frac <= -0.5 { whole--; }
+    }
+    return cast<double>(whole) / factor;
+}
+
+// ------------------------------------------------------- Tests ------------------------------------------------------
+
+#[test]
+f<bool> testTextFormatting() {
+    assert tplFormatLong(0l) == "0";
+    assert tplFormatLong(-1234l) == "-1234";
+    assert tplFormatLong(-9223372036854775807l - 1l) == "-9223372036854775808";
+    assert tplFormatDouble(2.0) == "2.0";
+    assert tplFormatDouble(0.1) == "0.1";
+    assert tplFormatDouble(-3.25) == "-3.25";
+    assert tplFormatFixed(3.14159, 2) == "3.14";
+    assert tplThousands(-1234567l, String(",")) == "-1,234,567";
+    return true;
+}
+
+#[test]
+f<bool> testTextScanning() {
+    long num = 0l;
+    double real = 0.0;
+    assert tplScanNumber(String(" 42 "), num, real) == TV_INT && num == 42l;
+    assert tplScanNumber(String("-1.5e2"), num, real) == TV_FLOAT && real == -150.0;
+    assert tplScanNumber(String("12a"), num, real) == TV_UNDEFINED;
+    assert tplScanNumber(String("-9223372036854775808"), num, real) == TV_INT && num == -9223372036854775807l - 1l;
+    assert tplScanNumber(String("99999999999999999999"), num, real) == TV_FLOAT;
+    return true;
+}
+
+#[test]
+f<bool> testTextEscaping() {
+    assert tplEscapeHtml(String("<a href=\"x\">'&'</a>")) == "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;";
+    assert tplUrlEncode(String("a b/c_d~")) == "a%20b%2Fc_d~";
+    assert tplUrlEncode(String("a b/c"), true) == "a%20b/c";
+    assert tplCompareText(String("a"), String("b")) < 0 && tplCompareText(String("b"), String("a")) > 0;
+    assert tplCharCount(String("caf\u00e9")) >= 4l;
+    assert tplReplace(String("aaa"), String("a"), String("b"), 2l) == "bba";
+    const Vector<String> words = tplSplit(String("  one two\n three "), String(""));
+    assert words.getSize() == 3l && words.get(2l) == "three";
+    const Vector<String> cells = tplSplit(String("a,,b"), String(","));
+    assert cells.getSize() == 3l && cells.get(1l).isEmpty();
+    return true;
+}

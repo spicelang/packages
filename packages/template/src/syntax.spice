@@ -1,0 +1,1523 @@
+// Std imports
+import "std/data/vector";
+
+// Own imports
+import "./text";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Compilation of templates: the source is cut into text and tags (with whitespace control), the tags are tokenized and
+// parsed into a tree of nodes and expressions. Nodes and expressions live in flat vectors of the template and refer to
+// each other by index.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Chunks of the source
+public const int TPL_CH_TEXT = 0;
+public const int TPL_CH_VERBATIM = 1;   // Text of a {% raw %} block
+public const int TPL_CH_OUT = 2;        // {{ ... }}
+public const int TPL_CH_RAW_OUT = 3;    // {{{ ... }}}
+public const int TPL_CH_STMT = 4;       // {% ... %}
+public const int TPL_CH_COMMENT = 5;    // {# ... #}
+
+// Tokens of a tag
+public const int TPL_TK_END = 0;
+public const int TPL_TK_NAME = 1;
+public const int TPL_TK_INT = 2;
+public const int TPL_TK_FLOAT = 3;
+public const int TPL_TK_STRING = 4;
+public const int TPL_TK_OP = 5;
+
+// Expressions
+public const int TPL_EX_LIT = 0;       // lit
+public const int TPL_EX_NAME = 1;      // name
+public const int TPL_EX_ATTR = 2;      // a.name
+public const int TPL_EX_ITEM = 3;      // a[b]
+public const int TPL_EX_SLICE = 4;     // a[b:c], b and c may be -1
+public const int TPL_EX_LIST = 5;      // [args...]
+public const int TPL_EX_MAP = 6;       // {args (keys): kwArgs (values)}
+public const int TPL_EX_UNARY = 7;     // name (operator) a
+public const int TPL_EX_BINARY = 8;    // a name (operator) b
+public const int TPL_EX_AND = 9;       // a and b
+public const int TPL_EX_OR = 10;       // a or b
+public const int TPL_EX_NOT = 11;      // not a
+public const int TPL_EX_COND = 12;     // a if b else c, c may be -1
+public const int TPL_EX_FILTER = 13;   // a | name(args, kwArgs)
+public const int TPL_EX_TEST = 14;     // a is [not] name(args)
+public const int TPL_EX_CALL = 15;     // a(args, kwArgs)
+
+// Nodes
+public const int TPL_ND_TEXT = 0;          // text
+public const int TPL_ND_OUT = 1;           // {{ expr }}, flag: unescaped
+public const int TPL_ND_IF = 2;            // expr, body, alt (an elif is a nested if in alt)
+public const int TPL_ND_FOR = 3;           // names (targets), expr (iterable), expr2 (filter), body, alt (else)
+public const int TPL_ND_SET = 4;           // names (target, optional attribute), expr
+public const int TPL_ND_SET_BLOCK = 5;     // names (target), body
+public const int TPL_ND_INCLUDE = 6;       // expr (template), names/exprs (arguments), flag: ignore missing, only
+public const int TPL_ND_EXTENDS = 7;       // expr (template)
+public const int TPL_ND_BLOCK = 8;         // text (name), body
+public const int TPL_ND_MACRO = 9;         // text (name), names (parameters), exprs (defaults or -1), body
+public const int TPL_ND_CALL_BLOCK = 10;   // expr (call), names/exprs (caller parameters), body
+public const int TPL_ND_IMPORT = 11;       // expr (template), text (aliasName)
+public const int TPL_ND_FROM_IMPORT = 12;  // expr (template), names, aliases
+public const int TPL_ND_WITH = 13;         // names/exprs, body
+public const int TPL_ND_FILTER_BLOCK = 14; // expr (filter chain on the name TPL_BODY_NAME), body
+public const int TPL_ND_AUTOESCAPE = 15;   // expr, body
+public const int TPL_ND_BREAK = 16;
+public const int TPL_ND_CONTINUE = 17;
+public const int TPL_ND_DO = 18;           // expr
+
+// Name of the variable that holds the body of a {% filter %} block. It cannot be written in a template.
+public const string TPL_BODY_NAME = "(body)";
+
+/**
+ * How the whitespace around tags is handled
+ */
+public type TplOptions struct {
+    public bool trimBlocks = false        // Remove the first line break after a block tag or comment
+    public bool lstripBlocks = false      // Remove the indentation before a block tag or comment that starts a line
+    public bool stripIndentation = false  // Remove whitespace with a line break between markup and tags
+}
+
+public type TplChunk struct {
+    public int kind = 0
+    public String text
+    public int line = 1
+    public bool trimLeft = false  // '-' after the opening delimiter
+    public bool trimRight = false // '-' before the closing delimiter
+    public bool keepLeft = false  // '+' after the opening delimiter: no lstripBlocks
+}
+
+public type TplToken struct {
+    public int kind = 0
+    public String text
+    public int line = 1
+}
+
+public type TplExpr struct {
+    public int kind = 0
+    public int line = 0
+    public String name
+    public int litKind = 0            // Literal: TV_NULL, TV_BOOL, TV_INT, TV_FLOAT or TV_STRING
+    public bool litFlag = false
+    public long litNum = 0l
+    public double litReal = 0.0
+    public String litText
+    public int a = -1
+    public int b = -1
+    public int c = -1
+    public bool negate = false
+    public Vector<int> args
+    public Vector<String> kwNames
+    public Vector<int> kwArgs
+}
+
+public type TplNode struct {
+    public int kind = 0
+    public int line = 0
+    public String text
+    public int expr = -1
+    public int expr2 = -1
+    public bool flag = false
+    public bool only = false
+    public Vector<String> names
+    public Vector<String> aliases
+    public Vector<int> exprs
+    public Vector<int> body
+    public Vector<int> alt
+}
+
+/**
+ * A compiled template
+ */
+public type TplTemplate struct {
+    public String name
+    public String error              // First problem found while compiling, "name:line: message"
+    public Vector<TplNode> nodes
+    public Vector<TplExpr> exprs
+    public Vector<int> root
+    public Vector<String> blockNames // All blocks, wherever they are
+    public Vector<int> blockNodes
+    public Vector<int> macros        // Top-level macros
+    public int extendsNode = -1      // Top-level extends
+    public int loopDepth = 0         // While parsing: number of enclosing loops (for break/continue)
+}
+
+/**
+ * Position in the tokens of one tag
+ */
+public type TplParser struct {
+    public Vector<TplToken> toks
+    public unsigned long pos = 0l
+}
+
+// ------------------------------------------------------ Helpers -----------------------------------------------------
+
+f<bool> tplWordIn(const String& word, string list) {
+    // `list` is a space separated list of words
+    const String all = String(list);
+    unsigned long start = 0l;
+    const unsigned long len = all.getLength();
+    while start < len {
+        long stop = all.find(' ', start);
+        if stop < 0l { stop = cast<long>(len); }
+        const String candidate = all.getSubstring(start, stop - cast<long>(start));
+        if candidate == word { return true; }
+        start = cast<unsigned long>(stop) + 1l;
+    }
+    return false;
+}
+
+f<int> tplCountLines(const String& text, unsigned long from, unsigned long to) {
+    int n = 0;
+    for unsigned long i = from; i < to; i++ {
+        if text[i] == '\n' { n++; }
+    }
+    return n;
+}
+
+f<bool> tplIsKeyword(const String& word) {
+    return tplWordIn(word, "and or not in is if else");
+}
+
+p TplTemplate.fail(int line, const String& message) {
+    if !this.error.isEmpty() { return; }
+    this.error = this.name + ":" + tplFormatLong(cast<long>(line)) + ": " + message;
+}
+
+p TplTemplate.fail(int line, string message) {
+    this.fail(line, String(message));
+}
+
+f<int> TplTemplate.addExpr(const TplExpr& e) {
+    this.exprs.pushBack(e);
+    return cast<int>(this.exprs.getSize()) - 1;
+}
+
+f<int> TplTemplate.addNode(const TplNode& n) {
+    this.nodes.pushBack(n);
+    return cast<int>(this.nodes.getSize()) - 1;
+}
+
+// ------------------------------------------------------ Scanner -----------------------------------------------------
+
+/**
+ * Index of `closer` after `from`, skipping quoted strings, or -1
+ */
+f<long> tplFindCloser(const String& src, unsigned long from, string closer) {
+    const unsigned long len = src.getLength();
+    const unsigned long closerLen = getRawLength(closer);
+    char quote = '\0';
+    for unsigned long i = from; i < len; i++ {
+        const char c = src[i];
+        if quote != '\0' {
+            if c == '\\' { i++; continue; }
+            if c == quote { quote = '\0'; }
+            continue;
+        }
+        if c == '"' || c == '\'' { quote = c; continue; }
+        if i + closerLen > len { return -1l; }
+        bool same = true;
+        for unsigned long k = 0l; k < closerLen; k++ {
+            if src[i + k] != closer[k] { same = false; break; }
+        }
+        if same { return cast<long>(i); }
+    }
+    return -1l;
+}
+
+/**
+ * Find the tag that ends a raw block: {% endraw %}, with optional whitespace control. Returns its start and end.
+ */
+f<bool> tplFindEndRaw(const String& src, unsigned long from, unsigned long& tagStart, unsigned long& tagEnd, bool& trimLeft, bool& trimRight) {
+    const unsigned long len = src.getLength();
+    unsigned long at = from;
+    while true {
+        const long found = src.find("{%", at);
+        if found < 0l { return false; }
+        unsigned long i = cast<unsigned long>(found) + 2l;
+        trimLeft = false;
+        trimRight = false;
+        if i < len && (src[i] == '-' || src[i] == '+') { trimLeft = src[i] == '-'; i++; }
+        while i < len && tplIsSpace(src[i]) { i++; }
+        if i + 6l <= len && src.getSubstring(i, 6l) == "endraw" {
+            i += 6l;
+            while i < len && tplIsSpace(src[i]) { i++; }
+            if i < len && src[i] == '-' { trimRight = true; i++; }
+            if i + 1l < len && src[i] == '%' && src[i + 1l] == '}' {
+                tagStart = cast<unsigned long>(found);
+                tagEnd = i + 2l;
+                return true;
+            }
+        }
+        at = cast<unsigned long>(found) + 2l;
+    }
+    return false;
+}
+
+f<bool> tplIsTag(const TplChunk& chunk) {
+    return chunk.kind != TPL_CH_TEXT && chunk.kind != TPL_CH_VERBATIM;
+}
+
+f<String> tplRstrip(const String& text) {
+    long end = cast<long>(text.getLength());
+    while end > 0l && tplIsSpace(text[cast<unsigned long>(end - 1l)]) { end--; }
+    return text.getSubstring(0l, end);
+}
+
+f<String> tplLstrip(const String& text) {
+    unsigned long start = 0l;
+    while start < text.getLength() && tplIsSpace(text[start]) { start++; }
+    return text.getSubstring(start);
+}
+
+/**
+ * Remove runs of whitespace with a line break that sit between markup ('>' or a tag) and markup ('<' or a tag)
+ */
+f<String> tplStripIndentation(const String& text) {
+    String kept;
+    const unsigned long len = text.getLength();
+    unsigned long i = 0l;
+    while i < len {
+        const char c = text[i];
+        if !tplIsSpace(c) { kept.append(c); i++; continue; }
+        unsigned long stop = i;
+        bool lineBreak = false;
+        while stop < len && tplIsSpace(text[stop]) {
+            if text[stop] == '\n' { lineBreak = true; }
+            stop++;
+        }
+        const bool afterMarkup = i == 0l || text[i - 1l] == '>';
+        const bool beforeMarkup = stop == len || text[stop] == '<';
+        if !(lineBreak && afterMarkup && beforeMarkup) {
+            for unsigned long k = i; k < stop; k++ { kept.append(text[k]); }
+        }
+        i = stop;
+    }
+    return kept;
+}
+
+/**
+ * Cut the source into text and tags, and apply the whitespace control
+ */
+f<Vector<TplChunk>> TplTemplate.scan(const String& src, const TplOptions& opts) {
+    Vector<TplChunk> chunks;
+    const unsigned long len = src.getLength();
+    unsigned long pos = 0l;
+    int line = 1;
+    while pos < len {
+        // Next opening delimiter: {{ {% or {#
+        long found = -1l;
+        for unsigned long i = pos; i + 1l < len; i++ {
+            if src[i] != '{' { continue; }
+            const char n = src[i + 1l];
+            if n == '{' || n == '%' || n == '#' { found = cast<long>(i); break; }
+        }
+        const unsigned long at = found < 0l ? len : cast<unsigned long>(found);
+        if at > pos {
+            TplChunk text;
+            text.kind = TPL_CH_TEXT;
+            text.text = src.getSubstring(pos, cast<long>(at - pos));
+            text.line = line;
+            chunks.pushBack(text);
+            line += tplCountLines(src, pos, at);
+        }
+        if found < 0l { break; }
+
+        TplChunk tag;
+        tag.line = line;
+        const char opener = src[at + 1l];
+        unsigned long skip = 2l;
+        string closer = "}}";
+        if opener == '%' { closer = "%}"; tag.kind = TPL_CH_STMT; }
+        else if opener == '#' { closer = "#}"; tag.kind = TPL_CH_COMMENT; }
+        else if at + 2l < len && src[at + 2l] == '{' { closer = "}}}"; tag.kind = TPL_CH_RAW_OUT; skip = 3l; }
+        else { tag.kind = TPL_CH_OUT; }
+        if tag.kind != TPL_CH_RAW_OUT && at + 2l < len {
+            if src[at + 2l] == '-' { tag.trimLeft = true; skip = 3l; }
+            else if src[at + 2l] == '+' { tag.keepLeft = true; skip = 3l; }
+        }
+        long stop = -1l;
+        if tag.kind == TPL_CH_COMMENT {
+            stop = src.find("#}", at + skip);
+        } else {
+            stop = tplFindCloser(src, at + skip, closer);
+        }
+        if stop < 0l {
+            this.fail(line, String("unterminated tag, expected ") + closer);
+            return chunks;
+        }
+        String body = src.getSubstring(at + skip, stop - cast<long>(at + skip));
+        if tag.kind != TPL_CH_RAW_OUT && !body.isEmpty() && body[body.getLength() - 1l] == '-' {
+            tag.trimRight = true;
+            body = body.getSubstring(0l, cast<long>(body.getLength()) - 1l);
+        }
+        tag.text = body.trim();
+        const unsigned long tagEnd = cast<unsigned long>(stop) + getRawLength(closer);
+        line += tplCountLines(src, at, tagEnd);
+        pos = tagEnd;
+
+        if tag.kind == TPL_CH_STMT && tag.text == "raw" {
+            // Everything up to {% endraw %} is text
+            unsigned long rawStart = 0l;
+            unsigned long rawEnd = 0l;
+            bool endTrimLeft = false;
+            bool endTrimRight = false;
+            if !tplFindEndRaw(src, pos, rawStart, rawEnd, endTrimLeft, endTrimRight) {
+                this.fail(tag.line, "raw block is never closed, expected {% endraw %}");
+                return chunks;
+            }
+            tag.kind = TPL_CH_COMMENT;
+            chunks.pushBack(tag);
+            TplChunk verbatim;
+            verbatim.kind = TPL_CH_VERBATIM;
+            verbatim.text = src.getSubstring(pos, cast<long>(rawStart - pos));
+            verbatim.line = line;
+            chunks.pushBack(verbatim);
+            line += tplCountLines(src, pos, rawEnd);
+            TplChunk endTag;
+            endTag.kind = TPL_CH_COMMENT;
+            endTag.line = line;
+            endTag.trimLeft = endTrimLeft;
+            endTag.trimRight = endTrimRight;
+            chunks.pushBack(endTag);
+            pos = rawEnd;
+            continue;
+        }
+        chunks.pushBack(tag);
+    }
+
+    // Whitespace control
+    for unsigned long i = 0l; i < chunks.getSize(); i++ {
+        const TplChunk tag = chunks.get(i);
+        if !tplIsTag(tag) { continue; }
+        const bool isBlock = tag.kind == TPL_CH_STMT || tag.kind == TPL_CH_COMMENT;
+        if i > 0l && !tplIsTag(chunks.get(i - 1l)) {
+            TplChunk& prev = chunks.get(i - 1l);
+            if tag.trimLeft {
+                prev.text = tplRstrip(prev.text);
+            } else if opts.lstripBlocks && isBlock && !tag.keepLeft && prev.kind == TPL_CH_TEXT {
+                // Only if the tag starts its line
+                long cut = cast<long>(prev.text.getLength());
+                while cut > 0l && (prev.text[cast<unsigned long>(cut - 1l)] == ' ' || prev.text[cast<unsigned long>(cut - 1l)] == '\t') { cut--; }
+                if (cut == 0l && i == 1l) || (cut > 0l && prev.text[cast<unsigned long>(cut - 1l)] == '\n') {
+                    prev.text = prev.text.getSubstring(0l, cut);
+                }
+            }
+        }
+        if i + 1l < chunks.getSize() && !tplIsTag(chunks.get(i + 1l)) {
+            TplChunk& next = chunks.get(i + 1l);
+            if tag.trimRight {
+                next.text = tplLstrip(next.text);
+            } else if opts.trimBlocks && isBlock && next.kind == TPL_CH_TEXT {
+                if next.text.startsWith("\r\n") { next.text = next.text.getSubstring(2l); }
+                else if next.text.startsWith("\n") { next.text = next.text.getSubstring(1l); }
+            }
+        }
+    }
+    if opts.stripIndentation {
+        for unsigned long i = 0l; i < chunks.getSize(); i++ {
+            TplChunk& chunk = chunks.get(i);
+            if chunk.kind == TPL_CH_TEXT { chunk.text = tplStripIndentation(chunk.text); }
+        }
+    }
+    return chunks;
+}
+
+// ----------------------------------------------------- Tokenizer ----------------------------------------------------
+
+/**
+ * Split the inside of a tag into tokens. Returns false (with `error`) on a character that cannot start a token.
+ */
+f<bool> tplTokenize(const String& src, int firstLine, Vector<TplToken>& out, String& error, int& errorLine) {
+    const unsigned long len = src.getLength();
+    unsigned long i = 0l;
+    int line = firstLine;
+    while i < len {
+        const char c = src[i];
+        if c == '\n' { line++; i++; continue; }
+        if tplIsSpace(c) { i++; continue; }
+        TplToken tok;
+        tok.line = line;
+        if tplIsAlpha(c) {
+            const unsigned long start = i;
+            while i < len && (tplIsAlpha(src[i]) || tplIsDigit(src[i])) { i++; }
+            tok.kind = TPL_TK_NAME;
+            tok.text = src.getSubstring(start, cast<long>(i - start));
+        } else if tplIsDigit(c) {
+            const unsigned long start = i;
+            tok.kind = TPL_TK_INT;
+            while i < len && tplIsDigit(src[i]) { i++; }
+            if i + 1l < len && src[i] == '.' && tplIsDigit(src[i + 1l]) {
+                tok.kind = TPL_TK_FLOAT;
+                i++;
+                while i < len && tplIsDigit(src[i]) { i++; }
+            }
+            if i < len && (src[i] == 'e' || src[i] == 'E') {
+                unsigned long k = i + 1l;
+                if k < len && (src[k] == '-' || src[k] == '+') { k++; }
+                if k < len && tplIsDigit(src[k]) {
+                    tok.kind = TPL_TK_FLOAT;
+                    i = k;
+                    while i < len && tplIsDigit(src[i]) { i++; }
+                }
+            }
+            tok.text = src.getSubstring(start, cast<long>(i - start));
+        } else if c == '"' || c == '\'' {
+            tok.kind = TPL_TK_STRING;
+            i++;
+            bool closed = false;
+            while i < len {
+                const char d = src[i];
+                if d == c { closed = true; i++; break; }
+                if d == '\n' { line++; }
+                if d == '\\' && i + 1l < len {
+                    const char e = src[i + 1l];
+                    if e == 'n' { tok.text.append('\n'); }
+                    else if e == 't' { tok.text.append('\t'); }
+                    else if e == 'r' { tok.text.append('\r'); }
+                    else { tok.text.append(e); }
+                    i += 2l;
+                    continue;
+                }
+                tok.text.append(d);
+                i++;
+            }
+            if !closed {
+                error = String("unterminated string");
+                errorLine = tok.line;
+                return false;
+            }
+        } else {
+            tok.kind = TPL_TK_OP;
+            String two;
+            if i + 1l < len {
+                two.append(c);
+                two.append(src[i + 1l]);
+            }
+            if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "//" || two == "**" {
+                tok.text = two;
+                i += 2l;
+            } else if tplWordIn(String(c), "+ - * / % ~ < > ( ) [ ] { } , . : | =") {
+                tok.text = String(c);
+                i++;
+            } else {
+                error = String("unexpected character '") + c + "'";
+                errorLine = line;
+                return false;
+            }
+        }
+        out.pushBack(tok);
+    }
+    TplToken end;
+    end.kind = TPL_TK_END;
+    end.line = line;
+    out.pushBack(end);
+    return true;
+}
+
+// ------------------------------------------------------ Parser ------------------------------------------------------
+
+f<TplToken> TplParser.peek() {
+    return this.toks.get(this.pos);
+}
+
+f<TplToken> TplParser.peekAt(unsigned long offset) {
+    const unsigned long at = this.pos + offset;
+    if at >= this.toks.getSize() { return this.toks.get(this.toks.getSize() - 1l); }
+    return this.toks.get(at);
+}
+
+f<int> TplParser.line() {
+    return this.toks.get(this.pos).line;
+}
+
+p TplParser.advance() {
+    if this.pos + 1l < this.toks.getSize() { this.pos++; }
+}
+
+f<bool> TplParser.atEnd() {
+    return this.toks.get(this.pos).kind == TPL_TK_END;
+}
+
+f<bool> TplParser.isOp(string op) {
+    const TplToken& tok = this.toks.get(this.pos);
+    return tok.kind == TPL_TK_OP && tok.text == op;
+}
+
+f<bool> TplParser.isWord(string word) {
+    const TplToken& tok = this.toks.get(this.pos);
+    return tok.kind == TPL_TK_NAME && tok.text == word;
+}
+
+/**
+ * Consume the operator if it is next
+ */
+f<bool> TplParser.skipOp(string op) {
+    if !this.isOp(op) { return false; }
+    this.advance();
+    return true;
+}
+
+f<bool> TplParser.skipWord(string word) {
+    if !this.isWord(word) { return false; }
+    this.advance();
+    return true;
+}
+
+f<String> tplDescribe(const TplToken& tok) {
+    if tok.kind == TPL_TK_END { return String("end of tag"); }
+    if tok.kind == TPL_TK_STRING { return String("string \"") + tok.text + "\""; }
+    return String("'") + tok.text + "'";
+}
+
+f<bool> TplTemplate.expectOp(TplParser& ps, string op) {
+    if ps.skipOp(op) { return true; }
+    const TplToken tok = ps.peek();
+    this.fail(tok.line, String("expected '") + op + "', found " + tplDescribe(tok));
+    return false;
+}
+
+f<bool> TplTemplate.expectWord(TplParser& ps, string word) {
+    if ps.skipWord(word) { return true; }
+    const TplToken tok = ps.peek();
+    this.fail(tok.line, String("expected '") + word + "', found " + tplDescribe(tok));
+    return false;
+}
+
+f<bool> TplTemplate.expectEnd(TplParser& ps) {
+    if ps.atEnd() { return true; }
+    const TplToken tok = ps.peek();
+    this.fail(tok.line, String("unexpected ") + tplDescribe(tok));
+    return false;
+}
+
+/**
+ * A name that is not a keyword
+ */
+f<String> TplTemplate.expectName(TplParser& ps) {
+    const TplToken tok = ps.peek();
+    if tok.kind != TPL_TK_NAME || tplIsKeyword(tok.text) {
+        this.fail(tok.line, String("expected a name, found ") + tplDescribe(tok));
+        return String("");
+    }
+    ps.advance();
+    return tok.text;
+}
+
+f<int> TplTemplate.literal(int line, int kind, bool flag, const String& text) {
+    TplExpr e;
+    e.kind = TPL_EX_LIT;
+    e.line = line;
+    e.litKind = kind;
+    e.litFlag = flag;
+    e.litText = text;
+    if kind == TV_INT || kind == TV_FLOAT {
+        // `text` holds the digits
+        e.litKind = tplScanNumber(text, e.litNum, e.litReal);
+        e.litText = String("");
+    }
+    return this.addExpr(e);
+}
+
+f<int> TplTemplate.binary(int kind, string op, int line, int a, int b) {
+    TplExpr e;
+    e.kind = kind;
+    e.name = String(op);
+    e.line = line;
+    e.a = a;
+    e.b = b;
+    return this.addExpr(e);
+}
+
+/**
+ * Full expression, including `a if b else c` when `allowCond` is set
+ */
+public f<int> TplTemplate.parseExpression(TplParser& ps, bool allowCond = true) {
+    const int value = this.parseOr(ps);
+    if value < 0 || !allowCond || !ps.isWord("if") { return value; }
+    const int line = ps.line();
+    ps.advance();
+    TplExpr e;
+    e.kind = TPL_EX_COND;
+    e.line = line;
+    e.a = value;
+    e.b = this.parseOr(ps);
+    if e.b < 0 { return -1; }
+    if ps.skipWord("else") {
+        e.c = this.parseExpression(ps, true);
+        if e.c < 0 { return -1; }
+    }
+    return this.addExpr(e);
+}
+
+f<int> TplTemplate.parseOr(TplParser& ps) {
+    int left = this.parseAnd(ps);
+    while left >= 0 && ps.isWord("or") {
+        const int line = ps.line();
+        ps.advance();
+        const int right = this.parseAnd(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_OR, "or", line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseAnd(TplParser& ps) {
+    int left = this.parseNot(ps);
+    while left >= 0 && ps.isWord("and") {
+        const int line = ps.line();
+        ps.advance();
+        const int right = this.parseNot(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_AND, "and", line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseNot(TplParser& ps) {
+    if ps.isWord("not") {
+        const int line = ps.line();
+        ps.advance();
+        const int operand = this.parseNot(ps);
+        if operand < 0 { return -1; }
+        return this.binary(TPL_EX_NOT, "not", line, operand, -1);
+    }
+    return this.parseCompare(ps);
+}
+
+f<int> TplTemplate.parseCompare(TplParser& ps) {
+    int left = this.parseConcat(ps);
+    while left >= 0 {
+        const TplToken tok = ps.peek();
+        String op;
+        if tok.kind == TPL_TK_OP && tplWordIn(tok.text, "== != < <= > >=") {
+            op = tok.text;
+            ps.advance();
+        } else if tok.kind == TPL_TK_NAME && tok.text == "in" {
+            op = String("in");
+            ps.advance();
+        } else if tok.kind == TPL_TK_NAME && tok.text == "not" {
+            const TplToken after = ps.peekAt(1l);
+            if after.kind != TPL_TK_NAME || after.text != "in" { break; }
+            op = String("notin");
+            ps.advance();
+            ps.advance();
+        } else {
+            break;
+        }
+        const int right = this.parseConcat(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_BINARY, op.getRaw(), tok.line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseConcat(TplParser& ps) {
+    int left = this.parseSum(ps);
+    while left >= 0 && ps.isOp("~") {
+        const int line = ps.line();
+        ps.advance();
+        const int right = this.parseSum(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_BINARY, "~", line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseSum(TplParser& ps) {
+    int left = this.parseProduct(ps);
+    while left >= 0 && (ps.isOp("+") || ps.isOp("-")) {
+        const TplToken tok = ps.peek();
+        ps.advance();
+        const int right = this.parseProduct(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_BINARY, tok.text.getRaw(), tok.line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseProduct(TplParser& ps) {
+    int left = this.parsePower(ps);
+    while left >= 0 && (ps.isOp("*") || ps.isOp("/") || ps.isOp("//") || ps.isOp("%")) {
+        const TplToken tok = ps.peek();
+        ps.advance();
+        const int right = this.parsePower(ps);
+        if right < 0 { return -1; }
+        left = this.binary(TPL_EX_BINARY, tok.text.getRaw(), tok.line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parsePower(TplParser& ps) {
+    const int left = this.parseUnary(ps);
+    if left >= 0 && ps.isOp("**") {
+        const int line = ps.line();
+        ps.advance();
+        // Right associative
+        const int right = this.parsePower(ps);
+        if right < 0 { return -1; }
+        return this.binary(TPL_EX_BINARY, "**", line, left, right);
+    }
+    return left;
+}
+
+f<int> TplTemplate.parseUnary(TplParser& ps) {
+    if ps.isOp("-") || ps.isOp("+") {
+        const TplToken tok = ps.peek();
+        ps.advance();
+        const int operand = this.parseUnary(ps);
+        if operand < 0 { return -1; }
+        return this.binary(TPL_EX_UNARY, tok.text.getRaw(), tok.line, operand, -1);
+    }
+    const int primary = this.parsePrimary(ps);
+    if primary < 0 { return -1; }
+    const int postfix = this.parsePostfix(ps, primary);
+    if postfix < 0 { return -1; }
+    return this.parseFilters(ps, postfix, false);
+}
+
+/**
+ * Arguments of a call: (a, b, name=c). The opening parenthesis is already consumed.
+ */
+f<bool> TplTemplate.parseArgs(TplParser& ps, TplExpr& into) {
+    if ps.skipOp(")") { return true; }
+    while true {
+        const TplToken tok = ps.peek();
+        const TplToken after = ps.peekAt(1l);
+        if tok.kind == TPL_TK_NAME && after.kind == TPL_TK_OP && after.text == "=" {
+            ps.advance();
+            ps.advance();
+            const int value = this.parseExpression(ps, true);
+            if value < 0 { return false; }
+            into.kwNames.pushBack(tok.text);
+            into.kwArgs.pushBack(value);
+        } else {
+            if into.kwArgs.getSize() > 0l {
+                this.fail(tok.line, "positional argument after a keyword argument");
+                return false;
+            }
+            const int value = this.parseExpression(ps, true);
+            if value < 0 { return false; }
+            into.args.pushBack(value);
+        }
+        if ps.skipOp(",") {
+            if ps.skipOp(")") { return true; }
+            continue;
+        }
+        return this.expectOp(ps, ")");
+    }
+    return false;
+}
+
+f<int> TplTemplate.parsePrimary(TplParser& ps) {
+    const TplToken tok = ps.peek();
+    if tok.kind == TPL_TK_NAME {
+        if tplIsKeyword(tok.text) {
+            this.fail(tok.line, String("unexpected ") + tplDescribe(tok));
+            return -1;
+        }
+        ps.advance();
+        if tok.text == "true" || tok.text == "True" { return this.literal(tok.line, TV_BOOL, true, String("")); }
+        if tok.text == "false" || tok.text == "False" { return this.literal(tok.line, TV_BOOL, false, String("")); }
+        if tok.text == "none" || tok.text == "None" || tok.text == "null" { return this.literal(tok.line, TV_NULL, false, String("")); }
+        TplExpr e;
+        e.kind = TPL_EX_NAME;
+        e.line = tok.line;
+        e.name = tok.text;
+        return this.addExpr(e);
+    }
+    if tok.kind == TPL_TK_INT || tok.kind == TPL_TK_FLOAT {
+        ps.advance();
+        return this.literal(tok.line, TV_INT, false, tok.text);
+    }
+    if tok.kind == TPL_TK_STRING {
+        ps.advance();
+        // Adjacent strings are joined, so long texts can be split
+        String text = tok.text;
+        while ps.peek().kind == TPL_TK_STRING {
+            const TplToken more = ps.peek();
+            text += more.text;
+            ps.advance();
+        }
+        return this.literal(tok.line, TV_STRING, false, text);
+    }
+    if tok.kind == TPL_TK_OP && tok.text == "(" {
+        ps.advance();
+        const int inner = this.parseExpression(ps, true);
+        if inner < 0 { return -1; }
+        if ps.isOp(",") {
+            // A tuple, which is a list here
+            TplExpr list;
+            list.kind = TPL_EX_LIST;
+            list.line = tok.line;
+            list.args.pushBack(inner);
+            while ps.skipOp(",") {
+                if ps.isOp(")") { break; }
+                const int item = this.parseExpression(ps, true);
+                if item < 0 { return -1; }
+                list.args.pushBack(item);
+            }
+            if !this.expectOp(ps, ")") { return -1; }
+            return this.addExpr(list);
+        }
+        if !this.expectOp(ps, ")") { return -1; }
+        return inner;
+    }
+    if tok.kind == TPL_TK_OP && tok.text == "[" {
+        ps.advance();
+        TplExpr list;
+        list.kind = TPL_EX_LIST;
+        list.line = tok.line;
+        while !ps.isOp("]") {
+            const int item = this.parseExpression(ps, true);
+            if item < 0 { return -1; }
+            list.args.pushBack(item);
+            if !ps.skipOp(",") { break; }
+        }
+        if !this.expectOp(ps, "]") { return -1; }
+        return this.addExpr(list);
+    }
+    if tok.kind == TPL_TK_OP && tok.text == "{" {
+        ps.advance();
+        TplExpr map;
+        map.kind = TPL_EX_MAP;
+        map.line = tok.line;
+        while !ps.isOp("}") {
+            const int key = this.parseExpression(ps, true);
+            if key < 0 { return -1; }
+            if !this.expectOp(ps, ":") { return -1; }
+            const int value = this.parseExpression(ps, true);
+            if value < 0 { return -1; }
+            map.args.pushBack(key);
+            map.kwArgs.pushBack(value);
+            if !ps.skipOp(",") { break; }
+        }
+        if !this.expectOp(ps, "}") { return -1; }
+        return this.addExpr(map);
+    }
+    this.fail(tok.line, String("expected an expression, found ") + tplDescribe(tok));
+    return -1;
+}
+
+/**
+ * Attribute access, subscripts and calls after a primary expression
+ */
+f<int> TplTemplate.parsePostfix(TplParser& ps, int base) {
+    int current = base;
+    while true {
+        const TplToken tok = ps.peek();
+        if tok.kind != TPL_TK_OP { return current; }
+        if tok.text == "." {
+            ps.advance();
+            const TplToken attr = ps.peek();
+            if attr.kind == TPL_TK_NAME {
+                ps.advance();
+                TplExpr e;
+                e.kind = TPL_EX_ATTR;
+                e.line = attr.line;
+                e.a = current;
+                e.name = attr.text;
+                current = this.addExpr(e);
+            } else if attr.kind == TPL_TK_INT {
+                ps.advance();
+                TplExpr e;
+                e.kind = TPL_EX_ITEM;
+                e.line = attr.line;
+                e.a = current;
+                e.b = this.literal(attr.line, TV_INT, false, attr.text);
+                current = this.addExpr(e);
+            } else {
+                this.fail(attr.line, String("expected an attribute name, found ") + tplDescribe(attr));
+                return -1;
+            }
+        } else if tok.text == "[" {
+            ps.advance();
+            TplExpr e;
+            e.kind = TPL_EX_ITEM;
+            e.line = tok.line;
+            e.a = current;
+            if !ps.isOp(":") {
+                e.b = this.parseExpression(ps, true);
+                if e.b < 0 { return -1; }
+            }
+            if ps.skipOp(":") {
+                e.kind = TPL_EX_SLICE;
+                if !ps.isOp("]") {
+                    e.c = this.parseExpression(ps, true);
+                    if e.c < 0 { return -1; }
+                }
+            }
+            if !this.expectOp(ps, "]") { return -1; }
+            current = this.addExpr(e);
+        } else if tok.text == "(" {
+            ps.advance();
+            TplExpr e;
+            e.kind = TPL_EX_CALL;
+            e.line = tok.line;
+            e.a = current;
+            if !this.parseArgs(ps, e) { return -1; }
+            current = this.addExpr(e);
+        } else {
+            return current;
+        }
+    }
+    return current;
+}
+
+/**
+ * Filters (| name(args), | name:arg) and tests (is [not] name args). With `first`, the first filter has no '|'.
+ */
+f<int> TplTemplate.parseFilters(TplParser& ps, int base, bool first) {
+    int current = base;
+    bool pending = first;
+    while true {
+        if pending || ps.isOp("|") {
+            if !pending { ps.advance(); }
+            pending = false;
+            const int line = ps.line();
+            TplExpr e;
+            e.kind = TPL_EX_FILTER;
+            e.line = line;
+            e.a = current;
+            e.name = this.expectName(ps);
+            if e.name.isEmpty() { return -1; }
+            if ps.skipOp("(") {
+                if !this.parseArgs(ps, e) { return -1; }
+            } else if ps.skipOp(":") {
+                // Short form with one argument: head:10, default:"x"
+                const int arg = this.parsePrimary(ps);
+                if arg < 0 { return -1; }
+                const int full = this.parsePostfix(ps, arg);
+                if full < 0 { return -1; }
+                e.args.pushBack(full);
+            }
+            current = this.addExpr(e);
+        } else if ps.isWord("is") {
+            const int line = ps.line();
+            ps.advance();
+            TplExpr e;
+            e.kind = TPL_EX_TEST;
+            e.line = line;
+            e.a = current;
+            e.negate = ps.skipWord("not");
+            const TplToken name = ps.peek();
+            if name.kind != TPL_TK_NAME {
+                this.fail(name.line, String("expected the name of a test, found ") + tplDescribe(name));
+                return -1;
+            }
+            ps.advance();
+            e.name = name.text;
+            if ps.skipOp("(") {
+                if !this.parseArgs(ps, e) { return -1; }
+            } else {
+                // One argument without parentheses: is divisibleby 3, is sameas none
+                const TplToken next = ps.peek();
+                const bool startsValue = next.kind == TPL_TK_INT || next.kind == TPL_TK_FLOAT || next.kind == TPL_TK_STRING ||
+                                         (next.kind == TPL_TK_NAME && !tplIsKeyword(next.text));
+                if startsValue {
+                    const int arg = this.parsePrimary(ps);
+                    if arg < 0 { return -1; }
+                    const int full = this.parsePostfix(ps, arg);
+                    if full < 0 { return -1; }
+                    e.args.pushBack(full);
+                }
+            }
+            current = this.addExpr(e);
+        } else {
+            return current;
+        }
+    }
+    return current;
+}
+
+// ---------------------------------------------------- Statements ----------------------------------------------------
+
+/**
+ * Parse nodes until one of the words in `ends` starts a statement, or the end of the template if `ends` is empty.
+ * The statement that ended the block is returned in `endWord` and `endPs` (positioned after the word).
+ */
+f<bool> TplTemplate.parseBlock(const Vector<TplChunk>& chunks, unsigned long& ci, Vector<int>& out, string ends, string opener, int openLine, String& endWord, TplParser& endPs) {
+    while ci < chunks.getSize() {
+        if !this.error.isEmpty() { return false; }
+        const TplChunk chunk = chunks.get(ci);
+        ci++;
+        if chunk.kind == TPL_CH_COMMENT { continue; }
+        if chunk.kind == TPL_CH_TEXT || chunk.kind == TPL_CH_VERBATIM {
+            if chunk.text.isEmpty() { continue; }
+            TplNode node;
+            node.kind = TPL_ND_TEXT;
+            node.line = chunk.line;
+            node.text = chunk.text;
+            out.pushBack(this.addNode(node));
+            continue;
+        }
+        TplParser ps;
+        String tokError;
+        int tokLine = chunk.line;
+        if !tplTokenize(chunk.text, chunk.line, ps.toks, tokError, tokLine) {
+            this.fail(tokLine, tokError);
+            return false;
+        }
+        if chunk.kind == TPL_CH_OUT || chunk.kind == TPL_CH_RAW_OUT {
+            if ps.atEnd() { this.fail(chunk.line, "empty expression"); return false; }
+            TplNode node;
+            node.kind = TPL_ND_OUT;
+            node.line = chunk.line;
+            node.flag = chunk.kind == TPL_CH_RAW_OUT;
+            node.expr = this.parseExpression(ps, true);
+            if node.expr < 0 || !this.expectEnd(ps) { return false; }
+            out.pushBack(this.addNode(node));
+            continue;
+        }
+        // Statement
+        const TplToken keyword = ps.peek();
+        if keyword.kind != TPL_TK_NAME {
+            this.fail(chunk.line, String("expected a statement, found ") + tplDescribe(keyword));
+            return false;
+        }
+        ps.advance();
+        if tplWordIn(keyword.text, ends) {
+            endWord = keyword.text;
+            endPs = ps;
+            return true;
+        }
+        const int node = this.parseStatement(chunks, ci, keyword.text, ps, chunk.line);
+        if node < 0 {
+            if this.error.isEmpty() { this.fail(chunk.line, String("unknown statement '") + keyword.text + "'"); }
+            return false;
+        }
+        out.pushBack(node);
+    }
+    if getRawLength(ends) > 0l {
+        this.fail(openLine, String("'") + opener + "' block is never closed");
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Parse the body of a block statement up to its end word, e.g. endfor. The end tag may repeat the block name.
+ */
+f<bool> TplTemplate.parseBody(const Vector<TplChunk>& chunks, unsigned long& ci, Vector<int>& out, string endWord, string opener, int line, const String& blockName) {
+    String found;
+    TplParser endPs;
+    if !this.parseBlock(chunks, ci, out, endWord, opener, line, found, endPs) { return false; }
+    if !blockName.isEmpty() && endPs.peek().kind == TPL_TK_NAME {
+        const TplToken name = endPs.peek();
+        if name.text != blockName {
+            this.fail(name.line, String("'") + endWord + " " + name.text + "' does not match '" + opener + " " + blockName + "'");
+            return false;
+        }
+        endPs.advance();
+    }
+    return this.expectEnd(endPs);
+}
+
+/**
+ * Parameters of a macro or call block: (a, b=default). The opening parenthesis is already consumed.
+ */
+f<bool> TplTemplate.parseParams(TplParser& ps, TplNode& node) {
+    if ps.skipOp(")") { return true; }
+    while true {
+        const String param = this.expectName(ps);
+        if param.isEmpty() { return false; }
+        int def = -1;
+        if ps.skipOp("=") {
+            def = this.parseExpression(ps, true);
+            if def < 0 { return false; }
+        }
+        node.names.pushBack(param);
+        node.exprs.pushBack(def);
+        if ps.skipOp(",") { continue; }
+        return this.expectOp(ps, ")");
+    }
+    return false;
+}
+
+/**
+ * Assignments name=value, separated by spaces or commas, until the end of the tag
+ */
+f<bool> TplTemplate.parseAssignments(TplParser& ps, TplNode& node) {
+    while !ps.atEnd() {
+        const String name = this.expectName(ps);
+        if name.isEmpty() || !this.expectOp(ps, "=") { return false; }
+        const int value = this.parseExpression(ps, true);
+        if value < 0 { return false; }
+        node.names.pushBack(name);
+        node.exprs.pushBack(value);
+        ps.skipOp(",");
+    }
+    return true;
+}
+
+f<int> TplTemplate.parseIf(const Vector<TplChunk>& chunks, unsigned long& ci, TplParser& ps, int line) {
+    TplNode node;
+    node.kind = TPL_ND_IF;
+    node.line = line;
+    node.expr = this.parseExpression(ps, true);
+    if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+    String endWord;
+    TplParser endPs;
+    if !this.parseBlock(chunks, ci, node.body, "elif else endif", "if", line, endWord, endPs) { return -1; }
+    if endWord == "elif" {
+        const int nested = this.parseIf(chunks, ci, endPs, endPs.line());
+        if nested < 0 { return -1; }
+        node.alt.pushBack(nested);
+    } else if endWord == "else" {
+        if !this.expectEnd(endPs) { return -1; }
+        if !this.parseBody(chunks, ci, node.alt, "endif", "if", line, String("")) { return -1; }
+    } else if !this.expectEnd(endPs) {
+        return -1;
+    }
+    return this.addNode(node);
+}
+
+f<int> TplTemplate.parseStatement(const Vector<TplChunk>& chunks, unsigned long& ci, const String& keyword, TplParser& ps, int line) {
+    TplNode node;
+    node.line = line;
+    const String none = String("");
+
+    if keyword == "if" { return this.parseIf(chunks, ci, ps, line); }
+
+    if keyword == "for" {
+        node.kind = TPL_ND_FOR;
+        while true {
+            const String target = this.expectName(ps);
+            if target.isEmpty() { return -1; }
+            node.names.pushBack(target);
+            if !ps.skipOp(",") { break; }
+        }
+        if !this.expectWord(ps, "in") { return -1; }
+        node.expr = this.parseExpression(ps, false);
+        if node.expr < 0 { return -1; }
+        if ps.skipWord("if") {
+            node.expr2 = this.parseExpression(ps, false);
+            if node.expr2 < 0 { return -1; }
+        }
+        if !this.expectEnd(ps) { return -1; }
+        this.loopDepth++;
+        String endWord;
+        TplParser endPs;
+        const bool bodyOk = this.parseBlock(chunks, ci, node.body, "else endfor", "for", line, endWord, endPs);
+        this.loopDepth--;
+        if !bodyOk || !this.expectEnd(endPs) { return -1; }
+        if endWord == "else" {
+            if !this.parseBody(chunks, ci, node.alt, "endfor", "for", line, none) { return -1; }
+        }
+        return this.addNode(node);
+    }
+
+    if keyword == "set" {
+        const String target = this.expectName(ps);
+        if target.isEmpty() { return -1; }
+        node.names.pushBack(target);
+        if ps.skipOp(".") {
+            const String attr = this.expectName(ps);
+            if attr.isEmpty() { return -1; }
+            node.names.pushBack(attr);
+        }
+        if ps.skipOp("=") {
+            node.kind = TPL_ND_SET;
+            node.expr = this.parseExpression(ps, true);
+            if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+            return this.addNode(node);
+        }
+        node.kind = TPL_ND_SET_BLOCK;
+        if ps.isOp("|") {
+            // {% set x | upper %} applies filters to the captured text
+            ps.advance();
+            TplExpr bodyName;
+            bodyName.kind = TPL_EX_NAME;
+            bodyName.line = line;
+            bodyName.name = String(TPL_BODY_NAME);
+            node.expr = this.parseFilters(ps, this.addExpr(bodyName), true);
+            if node.expr < 0 { return -1; }
+        }
+        if !this.expectEnd(ps) { return -1; }
+        if !this.parseBody(chunks, ci, node.body, "endset", "set", line, none) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "include" {
+        node.kind = TPL_ND_INCLUDE;
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 { return -1; }
+        if ps.isWord("ignore") {
+            ps.advance();
+            if !this.expectWord(ps, "missing") { return -1; }
+            node.flag = true;
+        }
+        if ps.skipWord("with") {
+            if ps.skipWord("context") {
+                // Default anyway
+            } else {
+                while !ps.atEnd() && !ps.isWord("only") {
+                    const String name = this.expectName(ps);
+                    if name.isEmpty() || !this.expectOp(ps, "=") { return -1; }
+                    const int value = this.parseExpression(ps, true);
+                    if value < 0 { return -1; }
+                    node.names.pushBack(name);
+                    node.exprs.pushBack(value);
+                    ps.skipOp(",");
+                }
+            }
+        }
+        if ps.skipWord("only") { node.only = true; }
+        else if ps.skipWord("without") {
+            if !this.expectWord(ps, "context") { return -1; }
+            node.only = true;
+        }
+        if !this.expectEnd(ps) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "extends" {
+        node.kind = TPL_ND_EXTENDS;
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "block" {
+        node.kind = TPL_ND_BLOCK;
+        node.text = this.expectName(ps);
+        if node.text.isEmpty() { return -1; }
+        ps.skipWord("scoped");
+        ps.skipWord("required");
+        if !this.expectEnd(ps) { return -1; }
+        for unsigned long i = 0l; i < this.blockNames.getSize(); i++ {
+            if this.blockNames.get(i) == node.text {
+                this.fail(line, String("block '") + node.text + "' is defined twice");
+                return -1;
+            }
+        }
+        // Register before the body, so the order of blockNames is the order in the source
+        const unsigned long slot = this.blockNames.getSize();
+        this.blockNames.pushBack(node.text);
+        this.blockNodes.pushBack(-1);
+        const int savedLoops = this.loopDepth;
+        this.loopDepth = 0;
+        const bool ok = this.parseBody(chunks, ci, node.body, "endblock", "block", line, node.text);
+        this.loopDepth = savedLoops;
+        if !ok { return -1; }
+        const int idx = this.addNode(node);
+        int& stored = this.blockNodes.get(slot);
+        stored = idx;
+        return idx;
+    }
+
+    if keyword == "macro" {
+        node.kind = TPL_ND_MACRO;
+        node.text = this.expectName(ps);
+        if node.text.isEmpty() || !this.expectOp(ps, "(") { return -1; }
+        if !this.parseParams(ps, node) || !this.expectEnd(ps) { return -1; }
+        const int savedLoops = this.loopDepth;
+        this.loopDepth = 0;
+        const bool ok = this.parseBody(chunks, ci, node.body, "endmacro", "macro", line, node.text);
+        this.loopDepth = savedLoops;
+        if !ok { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "call" {
+        node.kind = TPL_ND_CALL_BLOCK;
+        if ps.skipOp("(") {
+            if !this.parseParams(ps, node) { return -1; }
+        }
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 { return -1; }
+        if this.exprs.get(cast<unsigned long>(node.expr)).kind != TPL_EX_CALL {
+            this.fail(line, "call needs a macro call, e.g. {% call list(items) %}");
+            return -1;
+        }
+        if !this.expectEnd(ps) { return -1; }
+        const int savedLoops = this.loopDepth;
+        this.loopDepth = 0;
+        const bool ok = this.parseBody(chunks, ci, node.body, "endcall", "call", line, none);
+        this.loopDepth = savedLoops;
+        if !ok { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "import" {
+        node.kind = TPL_ND_IMPORT;
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 || !this.expectWord(ps, "as") { return -1; }
+        node.text = this.expectName(ps);
+        if node.text.isEmpty() || !this.expectEnd(ps) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "from" {
+        node.kind = TPL_ND_FROM_IMPORT;
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 || !this.expectWord(ps, "import") { return -1; }
+        while true {
+            const String name = this.expectName(ps);
+            if name.isEmpty() { return -1; }
+            String aliasName = name;
+            if ps.skipWord("as") {
+                aliasName = this.expectName(ps);
+                if aliasName.isEmpty() { return -1; }
+            }
+            node.names.pushBack(name);
+            node.aliases.pushBack(aliasName);
+            if !ps.skipOp(",") { break; }
+        }
+        if !this.expectEnd(ps) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "with" {
+        node.kind = TPL_ND_WITH;
+        if !this.parseAssignments(ps, node) { return -1; }
+        if !this.parseBody(chunks, ci, node.body, "endwith", "with", line, none) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "filter" {
+        node.kind = TPL_ND_FILTER_BLOCK;
+        TplExpr bodyName;
+        bodyName.kind = TPL_EX_NAME;
+        bodyName.line = line;
+        bodyName.name = String(TPL_BODY_NAME);
+        node.expr = this.parseFilters(ps, this.addExpr(bodyName), true);
+        if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+        if !this.parseBody(chunks, ci, node.body, "endfilter", "filter", line, none) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "autoescape" {
+        node.kind = TPL_ND_AUTOESCAPE;
+        if ps.atEnd() {
+            node.expr = this.literal(line, TV_BOOL, true, String(""));
+        } else {
+            node.expr = this.parseExpression(ps, true);
+            if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+        }
+        if !this.parseBody(chunks, ci, node.body, "endautoescape", "autoescape", line, none) { return -1; }
+        return this.addNode(node);
+    }
+
+    if keyword == "break" || keyword == "continue" {
+        if this.loopDepth == 0 {
+            this.fail(line, String("'") + keyword + "' outside of a loop");
+            return -1;
+        }
+        if !this.expectEnd(ps) { return -1; }
+        node.kind = keyword == "break" ? TPL_ND_BREAK : TPL_ND_CONTINUE;
+        return this.addNode(node);
+    }
+
+    if keyword == "do" {
+        node.kind = TPL_ND_DO;
+        node.expr = this.parseExpression(ps, true);
+        if node.expr < 0 || !this.expectEnd(ps) { return -1; }
+        return this.addNode(node);
+    }
+
+    if tplWordIn(keyword, "elif else endif endfor endset endblock endmacro endcall endwith endfilter endautoescape endraw") {
+        this.fail(line, String("unexpected '") + keyword + "'");
+        return -1;
+    }
+    this.fail(line, String("unknown statement '") + keyword + "'");
+    return -1;
+}
+
+/**
+ * Compile the source of the template. Problems are recorded in `error`.
+ */
+public p TplTemplate.compile(const String& source, const TplOptions& opts) {
+    const Vector<TplChunk> chunks = this.scan(source, opts);
+    if !this.error.isEmpty() { return; }
+    unsigned long ci = 0l;
+    String endWord;
+    TplParser endPs;
+    Vector<int> root;
+    if !this.parseBlock(chunks, ci, root, "", "", 0, endWord, endPs) { return; }
+    this.root = root;
+    for unsigned long i = 0l; i < root.getSize(); i++ {
+        const int idx = root.get(i);
+        const int kind = this.nodes.get(cast<unsigned long>(idx)).kind;
+        if kind == TPL_ND_MACRO { this.macros.pushBack(idx); }
+        if kind == TPL_ND_EXTENDS && this.extendsNode < 0 { this.extendsNode = idx; }
+    }
+}
+
+// ------------------------------------------------------- Tests ------------------------------------------------------
+
+f<TplTemplate> tplCompileForTest(string source) {
+    TplTemplate tpl;
+    tpl.name = String("t");
+    TplOptions opts;
+    tpl.compile(String(source), opts);
+    return tpl;
+}
+
+#[test]
+f<bool> testTokenizer() {
+    Vector<TplToken> toks;
+    String error;
+    int errorLine = 0;
+    assert tplTokenize(String("a.b[0] == 'x\\'y' and 1.5e3 // 2 ** n|f(k=1)"), 1, toks, error, errorLine);
+    assert toks.getSize() == 22l;
+    assert toks.get(0l).text == "a" && toks.get(1l).text == "." && toks.get(3l).text == "[";
+    assert toks.get(7l).kind == TPL_TK_STRING && toks.get(7l).text == "x'y";
+    assert toks.get(9l).kind == TPL_TK_FLOAT && toks.get(10l).text == "//";
+    Vector<TplToken> bad;
+    assert !tplTokenize(String("a ? b"), 3, bad, error, errorLine);
+    assert error.contains("unexpected character") && errorLine == 3;
+    return true;
+}
+
+#[test]
+f<bool> testParserStructure() {
+    const TplTemplate tpl = tplCompileForTest("{% extends \"base\" %}{% block a %}x{% block b %}{% endblock %}{% endblock a %}{% macro m(x, y=2) %}{{ x }}{% endmacro %}");
+    assert tpl.error.isEmpty();
+    assert tpl.extendsNode >= 0;
+    assert tpl.blockNames.getSize() == 2l && tpl.blockNames.get(0l) == "a" && tpl.blockNames.get(1l) == "b";
+    assert tpl.macros.getSize() == 1l;
+    return true;
+}
+
+#[test]
+f<bool> testParserErrors() {
+    const TplTemplate a = tplCompileForTest("line\n{% if x %}open");
+    assert a.error == "t:2: 'if' block is never closed";
+    const TplTemplate b = tplCompileForTest("{% endfor %}");
+    assert b.error == "t:1: unexpected 'endfor'";
+    const TplTemplate c = tplCompileForTest("{{ x");
+    assert c.error.contains("unterminated tag");
+    const TplTemplate d = tplCompileForTest("{{ a + }}");
+    assert d.error.contains("expected an expression");
+    const TplTemplate e = tplCompileForTest("{% block a %}{% endblock b %}");
+    assert e.error.contains("does not match");
+    const TplTemplate g = tplCompileForTest("{% break %}");
+    assert g.error.contains("outside of a loop");
+    const TplTemplate h = tplCompileForTest("{% frobnicate %}");
+    assert h.error.contains("unknown statement 'frobnicate'");
+    const TplTemplate k = tplCompileForTest("{% for x in y %}{% else %}{% endif %}");
+    assert k.error.contains("unexpected 'endif'");
+    return true;
+}
+
+#[test]
+f<bool> testWhitespaceControl() {
+    TplTemplate tpl;
+    tpl.name = String("t");
+    TplOptions opts;
+    const Vector<TplChunk> chunks = tpl.scan(String("a  {%- if x -%}  b {{- y }}\n"), opts);
+    assert chunks.get(0l).text == "a";
+    assert chunks.get(2l).text == "b";
+    assert chunks.get(4l).text == "\n";
+    opts.trimBlocks = true;
+    opts.lstripBlocks = true;
+    const Vector<TplChunk> blocks = tpl.scan(String("<ul>\n    {% for x in y %}\n    <li>\n    {%+ endfor %}\n</ul>"), opts);
+    assert blocks.get(0l).text == "<ul>\n";
+    assert blocks.get(2l).text == "    <li>\n    ";
+    assert blocks.get(4l).text == "</ul>";
+    const Vector<TplChunk> raw = tpl.scan(String("{% raw %}{{ x }}{%- endraw %} y"), opts);
+    assert raw.get(1l).kind == TPL_CH_VERBATIM && raw.get(1l).text == "{{ x }}";
+    const Vector<TplChunk> rawTrim = tpl.scan(String("{% raw -%} a {%- endraw %}"), opts);
+    assert rawTrim.get(1l).text == "a";
+    return true;
+}

@@ -60,7 +60,7 @@ per-platform table (Debian/Ubuntu, Fedora, macOS, Windows) in the package README
 1. `packages/<name>/` with the files above. The root `.gitignore` already ignores its `spice_packages/` directory.
 2. README: one-line intro, `## Installation` (the `[dependencies]` snippet and the import line), `## Quick start` with a
    complete `main`, then the API. Use `spice` fenced code blocks; the registry highlights them.
-3. Row in the package table of the root `README.md` (keep it alphabetical and the columns aligned).
+3. Row in the package table of the root `README.md`, with a Spice Rack link `https://rack.spicelang.com/packages/<name>` (keep it alphabetical and the columns aligned).
 4. Label entry in `.github/labeler.yml` (`'<name>': packages/<name>/**/*`). The label itself must exist in the GitHub
    repository; ask a maintainer to create it.
 5. `ci.toml`, if the package needs system libraries or a setup step in CI (below).

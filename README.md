@@ -16,14 +16,14 @@ This is the home repo of the official packages for the [Spice programming langua
 
 ## Packages
 
-| Package                         | Description                                                                                     |
-|---------------------------------|-------------------------------------------------------------------------------------------------|
-| [github](./packages/github)     | Client for the GitHub REST API (repositories, issues, pull requests, releases, Actions, search) |
-| [gtk4](./packages/gtk4)         | Bindings for the GTK 4 GUI toolkit                                                              |
-| [libcurl](./packages/libcurl)   | Bindings for libcurl, used for network transfers that need https                                |
-| [llvm](./packages/llvm)         | Bindings for the LLVM C API, to build, optimize and emit LLVM IR                                |
-| [semver](./packages/semver)     | Semantic versions and version constraints (`^`, `~`, wildcards, ranges)                         |
-| [sqlite](./packages/sqlite)     | Bindings for SQLite, an embedded, file-based SQL database                                       |
-| [template](./packages/template) | HTML template engine with a Jinja-like syntax (inheritance, macros, includes, filters)          |
+| Package                         | Description                                                                                     | Spice Rack                                               |
+|---------------------------------|-------------------------------------------------------------------------------------------------|----------------------------------------------------------|
+| [github](./packages/github)     | Client for the GitHub REST API (repositories, issues, pull requests, releases, Actions, search) | [github](https://rack.spicelang.com/packages/github)     |
+| [gtk4](./packages/gtk4)         | Bindings for the GTK 4 GUI toolkit                                                              | [gtk4](https://rack.spicelang.com/packages/gtk4)         |
+| [libcurl](./packages/libcurl)   | Bindings for libcurl, used for network transfers that need https                                | [libcurl](https://rack.spicelang.com/packages/libcurl)   |
+| [llvm](./packages/llvm)         | Bindings for the LLVM C API, to build, optimize and emit LLVM IR                                | [llvm](https://rack.spicelang.com/packages/llvm)         |
+| [semver](./packages/semver)     | Semantic versions and version constraints (`^`, `~`, wildcards, ranges)                         | [semver](https://rack.spicelang.com/packages/semver)     |
+| [sqlite](./packages/sqlite)     | Bindings for SQLite, an embedded, file-based SQL database                                       | [sqlite](https://rack.spicelang.com/packages/sqlite)     |
+| [template](./packages/template) | HTML template engine with a Jinja-like syntax (inheritance, macros, includes, filters)          | [template](https://rack.spicelang.com/packages/template) |
 
 © ChilliBits 2026

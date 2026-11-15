@@ -19,7 +19,6 @@ packages/<name>/
   <name>.spice      entry file: the public API users import
   src/*.spice       optional internal modules, imported from the entry file as "src/<module>"
   README.md         shown on the registry page
-  .gitignore        /spice_packages/
 ```
 
 ```toml
@@ -57,7 +56,7 @@ per-platform table (Debian/Ubuntu, Fedora, macOS, Windows) in the package README
 
 ## Adding a package — checklist
 
-1. `packages/<name>/` with the files above (copy the `.gitignore` of an existing package).
+1. `packages/<name>/` with the files above. The root `.gitignore` already ignores its `spice_packages/` directory.
 2. README: one-line intro, `## Installation` (the `[dependencies]` snippet and the import line), `## Quick start` with a
    complete `main`, then the API. Use `spice` fenced code blocks; the registry highlights them.
 3. Row in the package table of the root `README.md` (keep it alphabetical and the columns aligned).

@@ -64,7 +64,8 @@ per-platform table (Debian/Ubuntu, Fedora, macOS, Windows) in the package README
 4. Label entry in `.github/labeler.yml` (`'<name>': packages/<name>/**/*`). The label itself must exist in the GitHub
    repository; ask a maintainer to create it.
 5. `ci.toml`, if the package needs system libraries or a setup step in CI (below).
-6. Unit tests (below). Release it afterwards with the `spice-packages-release` skill.
+6. Option in the `package` choice list of `.github/workflows/release.yml` (alphabetical).
+7. Unit tests (below). Release it afterwards with the `spice-packages-release` skill.
 
 ## Tests
 

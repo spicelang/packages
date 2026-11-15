@@ -19,8 +19,13 @@ github-v0.2.0     gtk4-v0.1.0     libcurl-v0.1.0     sqlite-v0.1.0
    `^0.y.z`, so a breaking change must not ship as a patch release.
 2. **Update `packages/<name>/spice.toml`** in a PR: `version` to the new version, and `spice` if the package now needs a
    newer compiler. Merge it to `main` first; CI must be green.
-3. **Create the release** on `main` with tag and title `<name>-v<version>` (e.g. in the GitHub UI, or
-   `gh release create github-v0.3.0 --target main --title github-v0.3.0 --notes-file notes.md`). Creating releases is
+3. **Create the release** on `main` with tag and title `<name>-v<version>`, preferably with the **Release** workflow
+   (`.github/workflows/release.yml`): `gh workflow run release.yml -f package=github -f notes="- ..."`. It reads the
+   version from `spice.toml`, refuses an existing tag, a version not newer than the latest release or a `main` commit
+   whose `CI result` check is not green, and creates a pre-release by default (`-f prerelease=false` for a full one,
+   `-f dry-run=true` to only check). Without `notes`, it lists the commits that touched the package since its previous
+   release; edit out repo-maintenance commits or pass the notes explicitly. Manual fallback:
+   `gh release create github-v0.3.0 --target main --title github-v0.3.0 --notes-file notes.md`. Creating releases is
    done by a maintainer.
 4. **Release notes**: a short bullet list of user-visible changes, e.g.
 

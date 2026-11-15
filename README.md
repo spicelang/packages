@@ -25,5 +25,6 @@ This is the home repo of the official packages for the [Spice programming langua
 | [semver](./packages/semver)     | Semantic versions and version constraints (`^`, `~`, wildcards, ranges)                         | [semver](https://rack.spicelang.com/packages/semver)     |
 | [sqlite](./packages/sqlite)     | Bindings for SQLite, an embedded, file-based SQL database                                       | [sqlite](https://rack.spicelang.com/packages/sqlite)     |
 | [template](./packages/template) | HTML template engine with a Jinja-like syntax (inheritance, macros, includes, filters)          | [template](https://rack.spicelang.com/packages/template) |
+| [tpde](./packages/tpde)         | Bindings for TPDE, a fast LLVM IR to ELF object back end (Linux, x86_64 and aarch64)            | [tpde](https://rack.spicelang.com/packages/tpde)         |
 
 © ChilliBits 2026

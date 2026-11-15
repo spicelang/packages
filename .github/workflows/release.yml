@@ -16,6 +16,7 @@ on:
           - semver
           - sqlite
           - template
+          - tpde
       notes:
         description: Release notes (default - the commits that touched the package since its previous release)
         required: false

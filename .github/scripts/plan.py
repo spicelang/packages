@@ -1,8 +1,8 @@
 """Computes the test matrix of the CI workflow.
 
 Selects the packages affected by the changes of the triggering event and writes one matrix entry per package to the
-`matrix` output, with the entry file to test and the APT packages and named setup steps of the package and of the
-packages it depends on. The CI requirements of a package are read from its optional `ci.toml`:
+`matrix` output, with the entry file to test, the packages of this repository it depends on (directly or transitively)
+and the APT packages and named setup steps of the package and of the packages it depends on. The CI requirements of a package are read from its optional `ci.toml`:
 
     apt = ["libgtk-4-dev"]  # APT packages to install
     setup = ["llvm"]        # named setup steps of .github/workflows/ci.yml
@@ -94,6 +94,7 @@ def main():
         matrix.append({
             "name": name,
             "entry": manifests[name]["package"]["entry"],
+            "deps": sorted(required - {name}),
             "apt": sorted({a for r in required for a in ci_configs[r].get("apt", [])}),
             "setup": sorted({s for r in required for s in ci_configs[r].get("setup", [])}),
         })

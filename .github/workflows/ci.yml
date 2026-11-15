@@ -74,6 +74,21 @@ jobs:
           cache-key-suffix: linux-x64
           use-ccache: "false"
 
+      - name: Install package dependencies
+        # The packages of this repository, that the package depends on, are installed from the checkout instead of the
+        # registry, so that a change to a dependency is tested with its dependents. All of them go flat into the
+        # spice_packages dir of the package, like Spice Shaker installs them. They are copied, because the compiler does
+        # not follow symbolic links out of the dir of the main source file
+        if: join(matrix.deps, ' ') != ''
+        env:
+          PACKAGE: ${{ matrix.name }}
+          DEPS: ${{ join(matrix.deps, ' ') }}
+        run: |
+          mkdir -p "packages/$PACKAGE/spice_packages"
+          for dep in $DEPS; do
+            cp -r "packages/$dep" "packages/$PACKAGE/spice_packages/$dep"
+          done
+
       - name: Setup Spice
         uses: spicelang/spice-setup-action@v1
 

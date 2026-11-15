@@ -94,7 +94,7 @@ export SPICE_STD_DIR=/path/to/spice/std
 (cd packages/<name> && spice test -O0 <name>.spice)
 ```
 
-For a new package also check the root README table, `.github/labeler.yml` and, for bindings, the CI `apt-get` line.
+For a new package also check the root README table, `.github/labeler.yml` and, for bindings, the package's `ci.toml`.
 
 If the environment cannot run a check, say so explicitly in the PR description. Do not silently skip checks.
 
@@ -141,7 +141,7 @@ title as headline. Write clean incremental commits on your branch so the reviewe
 - [ ] All commits have a short descriptive headline (no type prefix)
 - [ ] Tests of the changed packages pass with the latest Spice release
 - [ ] Package README updated if the API or requirements changed
-- [ ] New package: root README table, labeler entry, CI system libraries
+- [ ] New package: root README table, labeler entry, `ci.toml` for system libraries
 - [ ] Breaking changes called out for the next version bump
 - [ ] Issue linked in footer (`Fixes #N` or `Refs #N`)
 - [ ] PR targets `main`

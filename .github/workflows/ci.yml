@@ -4,18 +4,49 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
   pull_request:
-    paths-ignore:
-      - '**.md'
+  schedule:
+    # Weekly run of all packages, to catch breakages by a new Spice release in packages that did not change
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  detect:
+    name: Detect changed packages
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Compute test matrix
+        # Selects the changed packages and their dependents, with the requirements from their ci.toml files. Changes to
+        # this workflow or the script, scheduled and manual runs test all packages
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          # On a pull request, the first parent of the merge commit is the tip of the base branch
+          BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event.before }}
+        run: python3 .github/scripts/plan.py
+
   test:
-    name: Test packages
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: read
+    name: Test ${{ matrix.name }}
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      # All packages are tested, even if one of them fails
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -23,59 +54,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install package dependencies
-        # Libraries that the binding packages link against
+      - name: Install APT packages
+        if: join(matrix.apt, ' ') != ''
+        env:
+          APT_PACKAGES: ${{ join(matrix.apt, ' ') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libcurl4-openssl-dev libsqlite3-dev
+          sudo apt-get install -y $APT_PACKAGES
 
-      - name: Setup Spice
-        uses: spicelang/spice-setup-action@v1
-
-      - name: Run tests
-        # Tests every package with the entry file of its spice.toml. All packages are tested, even if one of them fails.
-        # The llvm package is tested by the test-llvm job, because it needs an LLVM build
-        run: |
-          failed=()
-          for manifest in packages/*/spice.toml; do
-            dir=$(dirname "$manifest")
-            if [ "$dir" = "packages/llvm" ]; then
-              continue
-            fi
-            entry=$(sed -n 's/^entry *= *"\(.*\)"/\1/p' "$manifest")
-            echo "::group::$(basename "$dir")"
-            if ! (cd "$dir" && spice test -O0 "$entry"); then
-              failed+=("$(basename "$dir")")
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "::error::Tests failed for: ${failed[*]}"
-            exit 1
-          fi
-
-  test-llvm:
-    name: Test llvm package
-    runs-on: ubuntu-26.04
-    # The job only reads the repository, the latest Spice release and LLVM
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install package dependencies
-        # Ninja for the LLVM build, the libraries that the llvm package links besides LLVM
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build zlib1g-dev libzstd-dev libtinfo-dev uuid-dev
+      # Named setup steps, that a package requests with `setup = [...]` in its ci.toml. A new one needs to be added to
+      # KNOWN_SETUP_STEPS in .github/scripts/plan.py as well
 
       - name: Setup LLVM
         # The action of the Spice repository builds the LLVM version, that the compiler and the bindings target, and exports
         # LLVM_LIB_DIR and LLVM_INCLUDE_DIRS. The build is cached, so only the first run after an LLVM bump builds LLVM
+        if: contains(matrix.setup, 'llvm')
         uses: spicelang/spice/.github/actions/setup-llvm@main
         with:
           cache-key-suffix: linux-x64
@@ -85,5 +78,26 @@ jobs:
         uses: spicelang/spice-setup-action@v1
 
       - name: Run tests
-        working-directory: packages/llvm
-        run: spice test -O0 llvm.spice
+        working-directory: packages/${{ matrix.name }}
+        env:
+          ENTRY: ${{ matrix.entry }}
+        run: spice test -O0 "$ENTRY"
+
+  result:
+    # Stable check for the branch protection, because the test jobs are named after the packages and skipped if no package
+    # changed
+    name: CI result
+    needs: [detect, test]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check results
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          echo "detect: $DETECT_RESULT, test: $TEST_RESULT"
+          if [ "$DETECT_RESULT" != "success" ] || [ "$TEST_RESULT" = "failure" ] || [ "$TEST_RESULT" = "cancelled" ]; then
+            exit 1
+          fi

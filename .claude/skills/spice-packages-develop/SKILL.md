@@ -1,6 +1,6 @@
 ---
 name: spice-packages-develop
-description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, sqlite) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler, CI apt packages), unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
+description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, sqlite) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler), the per-package `ci.toml` with CI requirements, unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
 ---
 
 # Develop a package in spicelang/packages
@@ -18,6 +18,7 @@ packages/<name>/
   spice.toml        manifest (below)
   <name>.spice      entry file: the public API users import
   src/*.spice       optional internal modules, imported from the entry file as "src/<module>"
+  ci.toml           optional CI requirements (APT packages, named setup steps), see "Tests"
   README.md         shown on the registry page
 ```
 
@@ -51,7 +52,7 @@ through module attributes at the top of the entry file:
 ]
 ```
 
-A new system library needs its development package in the `apt-get install` line of `.github/workflows/ci.yml` and a
+A new system library needs its development package in the `apt` list of the package's `ci.toml` (see "Tests") and a
 per-platform table (Debian/Ubuntu, Fedora, macOS, Windows) in the package README, like the existing bindings.
 
 ## Adding a package — checklist
@@ -62,7 +63,8 @@ per-platform table (Debian/Ubuntu, Fedora, macOS, Windows) in the package README
 3. Row in the package table of the root `README.md` (keep it alphabetical and the columns aligned).
 4. Label entry in `.github/labeler.yml` (`'<name>': packages/<name>/**/*`). The label itself must exist in the GitHub
    repository; ask a maintainer to create it.
-5. Unit tests (below). Release it afterwards with the `spice-packages-release` skill.
+5. `ci.toml`, if the package needs system libraries or a setup step in CI (below).
+6. Unit tests (below). Release it afterwards with the `spice-packages-release` skill.
 
 ## Tests
 
@@ -79,11 +81,27 @@ f<bool> testPaths() {
 Tests must not need the network or a display (CI has neither GitHub credentials nor a GUI); test the pure parts such
 as parsing, encoding and path building.
 
-CI (`.github/workflows/ci.yml`) installs the **latest Spice release** and runs, for every `packages/*/spice.toml`:
+CI (`.github/workflows/ci.yml`) only tests the packages affected by a change: `.github/scripts/plan.py` selects every
+package with changed files under `packages/<name>/` (ignoring `*.md`), plus the packages that depend on one of them via
+`[dependencies]`. Changes to the workflow or the script, the weekly scheduled run and manual runs test all packages.
+Each selected package gets its own job, that installs only what the package and its dependencies list in their
+`ci.toml`, installs the **latest Spice release** and runs:
 
 ```sh
 cd packages/<name> && spice test -O0 <entry>
 ```
+
+`ci.toml` is optional; a package without system dependencies does not need one:
+
+```toml
+apt = ["libgtk-4-dev"]   # APT packages to install before the tests
+setup = ["llvm"]         # named setup steps of the workflow
+```
+
+A named setup step is a step in the `test` job of the workflow with `if: contains(matrix.setup, '<name>')` (named,
+because `uses:` cannot be computed per package). A new one needs that step and an entry in `KNOWN_SETUP_STEPS` of
+`plan.py`, which rejects unknown keys and step names. The `CI result` job is the stable check for branch protection.
+Run the planner locally to see what CI would test, e.g. `EVENT=pull_request BASE=main python3 .github/scripts/plan.py`.
 
 Run the same locally, with the std of the compiler you use:
 
@@ -98,8 +116,8 @@ Debian/Ubuntu). Since CI uses the latest release, a package may only use std API
 released; if a change needs an unreleased compiler, it has to wait for the next Spice release.
 
 The `llvm` package links a static LLVM build (the version of the Spice compiler, see its README) through the
-`LLVM_LIB_DIR` and `LLVM_INCLUDE_DIRS` variables. CI tests it in the separate `test-llvm` job, which builds LLVM with the
-`setup-llvm` action of the Spice repository, and the main test loop skips it.
+`LLVM_LIB_DIR` and `LLVM_INCLUDE_DIRS` variables. Its `ci.toml` requests the `llvm` setup step, which builds LLVM with
+the `setup-llvm` action of the Spice repository.
 
 CI does not install package dependencies. A package with a non-empty `[dependencies]` table needs that step added to
 the workflow (e.g. `spice-shaker sync` in its directory) first.

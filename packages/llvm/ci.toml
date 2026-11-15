@@ -1,0 +1,4 @@
+# Ninja for the LLVM build, the libraries that the llvm package links besides LLVM
+apt = ["ninja-build", "zlib1g-dev", "libzstd-dev", "libtinfo-dev", "uuid-dev"]
+# Builds the LLVM version of the Spice compiler and exports LLVM_LIB_DIR and LLVM_INCLUDE_DIRS
+setup = ["llvm"]

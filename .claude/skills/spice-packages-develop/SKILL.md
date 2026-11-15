@@ -1,6 +1,6 @@
 ---
 name: spice-packages-develop
-description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, sqlite) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler), the per-package `ci.toml` with CI requirements, unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
+description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, llvm, semver, sqlite, template, tpde) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler), the per-package `ci.toml` with CI requirements, unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
 ---
 
 # Develop a package in spicelang/packages
@@ -38,7 +38,7 @@ entry = "<name>.spice"          # CI tests this file
 
 Users import the entry file without the extension: `import "spice_packages/<name>/<name>";`.
 
-## Binding packages (gtk4, libcurl, llvm, sqlite)
+## Binding packages (gtk4, libcurl, llvm, sqlite, tpde)
 
 Bindings declare the C functions with `ext f<…> name(…);` and wrap them in Spice types. They link the system library
 through module attributes at the top of the entry file:
@@ -120,5 +120,17 @@ The `llvm` package links a static LLVM build (the version of the Spice compiler,
 `LLVM_LIB_DIR` and `LLVM_INCLUDE_DIRS` variables. Its `ci.toml` requests the `llvm` setup step, which builds LLVM with
 the `setup-llvm` action of the Spice repository.
 
-CI does not install package dependencies. A package with a non-empty `[dependencies]` table needs that step added to
-the workflow (e.g. `spice-shaker sync` in its directory) first.
+The `tpde` package builds on the `llvm` package. It gets `TPDE_FLAGS` from the compiler, which sets it from the TPDE
+libraries that the Linux release std ships, so CI needs no extra setup step for it.
+
+## Dependencies on other packages
+
+A package can depend on another package of this repository via `[dependencies]` (e.g. `llvm = "^0.1.0"` in `tpde`).
+Spice Shaker installs all packages of a project flat into the `spice_packages` dir of the project root, so a package
+imports its dependency relative to the main source file: `import "@/spice_packages/llvm/llvm" as llvm;`. A plain
+`"spice_packages/..."` import would be resolved against the dir of the importing package instead.
+
+CI installs the in-repo dependencies (direct and transitive) from the checkout, by copying `packages/<dep>` to
+`packages/<name>/spice_packages/<dep>` (the `deps` of the matrix entry), and it also tests the dependents of a changed
+package. Copy them the same way to test locally; symbolic links do not work, because the compiler does not follow them
+out of the dir of the main source file. Dependencies outside of this repository are not installed by CI.

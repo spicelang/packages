@@ -1,0 +1,293 @@
+#![core.compiler.warnings.ignore]
+
+// Std imports
+import "std/data/vector";
+import "std/io/file";
+
+// Package imports
+// Resolved against the dir of the main source file, where Spice Shaker installs the llvm dependency next to this package
+import "@/spice_packages/llvm/llvm" as llvm;
+
+// Own imports
+import "src/linker-flags";
+
+// ===== External type definitions =====
+type VoidPtr alias byte*;
+type LLVMBool alias int;
+type LLVMModuleRef alias VoidPtr;
+type LLVMMemoryBufferRef alias VoidPtr;
+type TPDECompilerRef alias VoidPtr;
+
+// ===== External functions =====
+// TPDE C API wrapper (see tpde-wrapper.cpp)
+ext f<LLVMBool> TPDEIsAvailable();
+ext f<TPDECompilerRef> TPDECreateCompiler(string /*Triple*/);
+ext p TPDEDisposeCompiler(TPDECompilerRef /*Compiler*/);
+ext f<LLVMBool> TPDECompileToObjectFile(TPDECompilerRef /*Compiler*/, LLVMModuleRef /*M*/, string /*Filename*/, string* /*ErrorMessage*/);
+ext f<LLVMBool> TPDECompileToMemoryBuffer(TPDECompilerRef /*Compiler*/, LLVMModuleRef /*M*/, LLVMMemoryBufferRef* /*OutMemBuf*/, string* /*ErrorMessage*/);
+// LLVM C API
+ext f<byte*> LLVMGetBufferStart(LLVMMemoryBufferRef /*MemBuf*/);
+ext f<unsigned long> LLVMGetBufferSize(LLVMMemoryBufferRef /*MemBuf*/);
+ext p LLVMDisposeMemoryBuffer(LLVMMemoryBufferRef /*MemBuf*/);
+ext p LLVMDisposeMessage(string /*Message*/);
+
+/**
+ * Check if these bindings are backed by TPDE. They are not on platforms TPDE does not support (TPDE only emits ELF objects
+ * for x86_64 and aarch64) and when TPDE_FLAGS was not set while linking.
+ *
+ * @return TPDE available or not
+ */
+public f<bool> isAvailable() {
+    return TPDEIsAvailable() != 0;
+}
+
+// ===== Compiler =====
+
+/**
+ * TPDE compiler for a specific target, like tpde_llvm::LLVMCompiler. It compiles LLVM modules to ELF objects with -O0-quality
+ * code, but a lot faster than the LLVM back end.
+ */
+public type Compiler struct {
+    TPDECompilerRef self
+    llvm::Triple triple
+}
+
+/**
+ * Create a TPDE compiler for the given target triple. Use isValid() to check if TPDE supports the triple.
+ *
+ * @param triple Target triple
+ */
+public p Compiler.ctor(const llvm::Triple& triple) {
+    this.triple = triple;
+    this.self = TPDECreateCompiler(this.triple.value);
+}
+
+/**
+ * A compiler owns its TPDE compiler, so copies create their own one for the same target. Otherwise, they would share it and
+ * it would be disposed as soon as the first of the copies goes out of scope.
+ *
+ * @param other Compiler to copy
+ */
+public p Compiler.ctor(const Compiler& other) {
+    this.triple = other.triple;
+    this.self = nil<TPDECompilerRef>;
+    if other.self != nil<TPDECompilerRef> {
+        this.self = TPDECreateCompiler(this.triple.value);
+    }
+}
+
+/**
+ * Assign another compiler. Like the copy constructor, this creates an own TPDE compiler for the target of the other one.
+ *
+ * @param other Compiler to assign
+ */
+public p operator=(Compiler& this, const Compiler& other) {
+    // Valid compilers never share a TPDE compiler, so the same one means self-assignment
+    if this.self != nil<TPDECompilerRef> && this.self == other.self {
+        return;
+    }
+    if this.self != nil<TPDECompilerRef> {
+        TPDEDisposeCompiler(this.self);
+    }
+    this.triple = other.triple;
+    this.self = nil<TPDECompilerRef>;
+    if other.self != nil<TPDECompilerRef> {
+        this.self = TPDECreateCompiler(this.triple.value);
+    }
+}
+
+/**
+ * Dispose the TPDE compiler
+ */
+public p Compiler.dtor() {
+    if this.self != nil<TPDECompilerRef> {
+        TPDEDisposeCompiler(this.self);
+        this.self = nil<TPDECompilerRef>;
+    }
+}
+
+/**
+ * Check if the compiler could be created. This is not the case, if TPDE does not support the target triple or if the
+ * bindings are not backed by TPDE.
+ *
+ * @return Valid or not
+ */
+public const f<bool> Compiler.isValid() {
+    return this.self != nil<TPDECompilerRef>;
+}
+
+/**
+ * Compile the given module to an ELF object file. The module might be modified during compilation.
+ *
+ * @param module Module to compile
+ * @param filename Output file path
+ * @param errorMessage Error message, if the compilation failed. Cleared if it succeeded
+ * @return True if the compilation failed
+ */
+public f<bool> Compiler.compileToFile(llvm::Module& module, string filename, String& errorMessage) {
+    if !this.isValid() {
+        errorMessage = String("The TPDE compiler is not valid");
+        return true;
+    }
+    errorMessage.clear();
+    string outMessage = nil<string>;
+    const bool errorOccurred = TPDECompileToObjectFile(this.self, module.getRef(), filename, &outMessage) != 0;
+    if outMessage != nil<string> {
+        errorMessage = String(outMessage);
+        LLVMDisposeMessage(outMessage);
+    }
+    return errorOccurred;
+}
+
+/**
+ * Compile the given module to an ELF object in memory. The module might be modified during compilation.
+ *
+ * @param module Module to compile
+ * @param output Bytes of the emitted object
+ * @param errorMessage Error message, if the compilation failed. Cleared if it succeeded
+ * @return True if the compilation failed
+ */
+public f<bool> Compiler.compileToBuffer(llvm::Module& module, Vector<byte>& output, String& errorMessage) {
+    if !this.isValid() {
+        errorMessage = String("The TPDE compiler is not valid");
+        return true;
+    }
+    errorMessage.clear();
+    string outMessage = nil<string>;
+    LLVMMemoryBufferRef buffer = nil<LLVMMemoryBufferRef>;
+    const bool errorOccurred = TPDECompileToMemoryBuffer(this.self, module.getRef(), &buffer, &outMessage) != 0;
+    if outMessage != nil<string> {
+        errorMessage = String(outMessage);
+        LLVMDisposeMessage(outMessage);
+    }
+    if errorOccurred {
+        return true;
+    }
+    // Copy the object bytes out of the buffer. They can contain zero bytes, so the buffer can't be treated as a string
+    const byte* bufferStart = LLVMGetBufferStart(buffer);
+    const unsigned long bufferSize = LLVMGetBufferSize(buffer);
+    output.clear();
+    output.reserve(bufferSize);
+    unsafe {
+        for unsigned long i = 0l; i < bufferSize; i++ {
+            output.pushBack(bufferStart[i]);
+        }
+    }
+    LLVMDisposeMemoryBuffer(buffer);
+    return false;
+}
+
+// ===== Tests =====
+
+// Build a module with a function, that adds its two arguments
+f<llvm::Function> buildTestAddFunction(llvm::LLVMContext& context, llvm::Module& module) {
+    llvm::IRBuilder builder = llvm::IRBuilder(context);
+    Vector<llvm::Type> argTypes;
+    argTypes.pushBack(builder.getInt32Ty());
+    argTypes.pushBack(builder.getInt32Ty());
+    llvm::Type funcType = llvm::getFunctionType(builder.getInt32Ty(), argTypes);
+    llvm::Function func = llvm::Function(module, "add", funcType);
+    func.setLinkage(llvm::LLVMLinkage::ExternalLinkage);
+
+    llvm::BasicBlock entry = llvm::BasicBlock(context, "");
+    func.pushBack(entry);
+    builder.setInsertPoint(entry);
+    llvm::Value sum = builder.createAdd(func.getArg(0u), func.getArg(1u), "sum");
+    builder.createRet(sum);
+    return func;
+}
+
+// Compiles with a copy of the compiler, that is disposed when the function returns
+f<unsigned long> compileWithTestCopy(const Compiler& original, llvm::Module& module) {
+    Compiler copy = original;
+    assert copy.isValid();
+    Vector<byte> objectBytes;
+    String errorMessage;
+    assert !copy.compileToBuffer(module, objectBytes, errorMessage);
+    return objectBytes.getSize();
+}
+
+#[test]
+f<bool> testUnsupportedTarget() {
+    // TPDE does not support WebAssembly. Without TPDE, no compiler is valid
+    llvm::LLVMContext context;
+    llvm::Module module = llvm::Module("tpde-test", context);
+    Compiler wasmCompiler = Compiler(llvm::Triple("wasm32-unknown-unknown"));
+    assert !wasmCompiler.isValid();
+    Vector<byte> objectBytes;
+    String errorMessage;
+    assert wasmCompiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert errorMessage == "The TPDE compiler is not valid";
+    assert wasmCompiler.compileToFile(module, "./tpde-test-wasm.o", errorMessage);
+    assert errorMessage == "The TPDE compiler is not valid";
+
+    // Copies of an invalid compiler are invalid as well
+    Compiler copy = wasmCompiler;
+    assert !copy.isValid();
+    return true;
+}
+
+#[test]
+f<bool> testCompileModule() {
+    // TPDE is only available on Linux and if the TPDE libraries are linked (see src/linker-flags.spice)
+    if !isAvailable() {
+        printf("TPDE is not available, skipping\n");
+        return true;
+    }
+
+    llvm::initializeNativeTarget();
+    llvm::initializeNativeAsmPrinter();
+    const llvm::Triple targetTriple = llvm::getDefaultTargetTriple();
+    string error;
+    llvm::Target target = llvm::getTargetFromTriple(targetTriple, &error);
+    llvm::TargetMachine targetMachine = target.createTargetMachine(targetTriple, "generic", "", llvm::LLVMCodeGenOptLevel::None, llvm::LLVMRelocMode::PIC, llvm::LLVMCodeModel::Default);
+
+    llvm::LLVMContext context;
+    llvm::Module module = llvm::Module("tpde-test", context);
+    module.setDataLayout(targetMachine.createDataLayout());
+    module.setTargetTriple(targetTriple);
+    llvm::Function addFunc = buildTestAddFunction(context, module);
+    assert !llvm::verifyFunction(addFunc);
+
+    Compiler compiler = Compiler(targetTriple);
+    assert compiler.isValid();
+
+    // Compile to memory and check, that the result is a 64-bit ELF object
+    Vector<byte> objectBytes;
+    String errorMessage;
+    assert !compiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert errorMessage.isEmpty();
+    assert objectBytes.getSize() > 64ul; // Larger than the ELF header
+    assert cast<int>(objectBytes.get(0ul)) == 0x7F;
+    assert cast<char>(objectBytes.get(1ul)) == 'E';
+    assert cast<char>(objectBytes.get(2ul)) == 'L';
+    assert cast<char>(objectBytes.get(3ul)) == 'F';
+    assert cast<int>(objectBytes.get(4ul)) == 2; // ELFCLASS64
+    assert cast<int>(objectBytes.get(16ul)) == 1; // ET_REL (relocatable object)
+
+    // Compile to a file and check, that it has the same size
+    const string objectPath = "./tpde-test.o";
+    assert !compiler.compileToFile(module, objectPath, errorMessage);
+    assert fileExists(objectPath);
+    const Result<unsigned long> objectFileSize = getFileSize(objectPath);
+    assert deleteFile(objectPath);
+    assert objectFileSize.unwrap() == objectBytes.getSize();
+
+    // A successful compilation clears the error message of a previous one
+    Compiler wasmCompiler = Compiler(llvm::Triple("wasm32-unknown-unknown"));
+    assert wasmCompiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert !errorMessage.isEmpty();
+    assert !compiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert errorMessage.isEmpty();
+
+    // Copies and assigned compilers own their TPDE compiler, so the original stays usable once they are disposed
+    const unsigned long objectSize = objectBytes.getSize();
+    assert compileWithTestCopy(compiler, module) == objectSize;
+    wasmCompiler = compiler;
+    assert wasmCompiler.isValid();
+    assert !wasmCompiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert objectBytes.getSize() == objectSize;
+    assert !compiler.compileToBuffer(module, objectBytes, errorMessage);
+    assert objectBytes.getSize() == objectSize;
+    return true;
+}

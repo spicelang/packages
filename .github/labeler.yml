@@ -33,6 +33,11 @@
       - any-glob-to-any-file:
           - 'packages/template/**/*'
 
+'tpde':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/tpde/**/*'
+
 'documentation':
   - changed-files:
       - any-glob-to-any-file:

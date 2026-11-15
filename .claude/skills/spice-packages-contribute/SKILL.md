@@ -141,7 +141,7 @@ title as headline. Write clean incremental commits on your branch so the reviewe
 - [ ] All commits have a short descriptive headline (no type prefix)
 - [ ] Tests of the changed packages pass with the latest Spice release
 - [ ] Package README updated if the API or requirements changed
-- [ ] New package: root README table, labeler entry, `ci.toml` for system libraries
+- [ ] New package: root README table, labeler entry, release workflow option, `ci.toml` for system libraries
 - [ ] Breaking changes called out for the next version bump
 - [ ] Issue linked in footer (`Fixes #N` or `Refs #N`)
 - [ ] PR targets `main`

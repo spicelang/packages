@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to release, with the version from its spice.toml
+        required: true
+        type: choice
+        # Keep in sync with the packages directory
+        options:
+          - github
+          - gtk4
+          - libcurl
+          - llvm
+          - semver
+          - sqlite
+          - template
+      notes:
+        description: Release notes (default - the commits that touched the package since its previous release)
+        required: false
+        type: string
+      prerelease:
+        description: Mark as pre-release
+        required: false
+        type: boolean
+        default: true
+      dry-run:
+        description: Dry run (only check and print the release)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One release at a time, so two runs cannot race for the same tag
+concurrency:
+  group: release
+
+jobs:
+  release:
+    name: Release ${{ inputs.package }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # Tags are needed to find the previous release of the package
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create release
+        env:
+          PACKAGE: ${{ inputs.package }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/release.py

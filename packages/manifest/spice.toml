@@ -1,6 +1,6 @@
 [package]
 name = "manifest"
-version = "0.1.0"
+version = "0.1.1"
 description = "Model, validation and comment-preserving editing of spice.toml, the manifest of Spice packages"
 license = "MIT"
 authors = ["Marc Auberer <marc.auberer@chillibits.com>"]

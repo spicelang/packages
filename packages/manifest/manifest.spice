@@ -12,7 +12,6 @@ import "@/spice_packages/semver/semver";
 
 // Own imports
 import "src/layout";
-import "src/text";
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The project manifest spice.toml of Spice packages: model, validation and editing. The format is specified in the README.
@@ -45,7 +44,7 @@ const string DEPENDENCY_KEYS = "version,github,rev,path";
 // Names
 // ---------------------------------------------------------------------------------------------------------------------
 
-f<bool> isLowerAlnum(char c) {
+f<bool> isLowerAlnumNameChar(char c) {
     return isLower(c) || isDigit(c);
 }
 
@@ -56,10 +55,10 @@ f<bool> isLowerAlnum(char c) {
  */
 public f<bool> isValidPackageName(const String& name) {
     const unsigned long len = name.getLength();
-    if len == 0l || len > MAX_NAME_LENGTH || !isLowerAlnum(name[0l]) { return false; }
+    if len == 0l || len > MAX_NAME_LENGTH || !isLowerAlnumNameChar(name[0l]) { return false; }
     for unsigned long i = 1l; i < len; i++ {
         const char c = name[i];
-        if !isLowerAlnum(c) && c != '-' && c != '_' { return false; }
+        if !isLowerAlnumNameChar(c) && c != '-' && c != '_' { return false; }
     }
     return true;
 }
@@ -70,7 +69,7 @@ public f<bool> isValidPackageName(const String& name) {
  */
 public f<bool> isValidRegistryName(const String& name) {
     const unsigned long len = name.getLength();
-    if len < MIN_REGISTRY_NAME_LENGTH || len > MAX_NAME_LENGTH || !isLowerAlnum(name[0l]) || !isLowerAlnum(name[len - 1l]) {
+    if len < MIN_REGISTRY_NAME_LENGTH || len > MAX_NAME_LENGTH || !isLowerAlnumNameChar(name[0l]) || !isLowerAlnumNameChar(name[len - 1l]) {
         return false;
     }
     for unsigned long i = 1l; i < len; i++ {
@@ -79,7 +78,7 @@ public f<bool> isValidRegistryName(const String& name) {
             if name[i - 1l] == '-' { return false; }
             continue;
         }
-        if !isLowerAlnum(c) { return false; }
+        if !isLowerAlnumNameChar(c) { return false; }
     }
     return true;
 }
@@ -99,10 +98,10 @@ public f<String> sanitizeName(const String& input) {
     String sanitized;
     for unsigned long i = 0l; i < lowered.getLength() && i < MAX_NAME_LENGTH; i++ {
         const char c = lowered[i];
-        sanitized.append(isLowerAlnum(c) || c == '-' || c == '_' ? c : '-');
+        sanitized.append(isLowerAlnumNameChar(c) || c == '-' || c == '_' ? c : '-');
     }
     // The first character has to be a letter or digit
-    while !sanitized.isEmpty() && !isLowerAlnum(sanitized[0l]) { sanitized = sanitized.getSubstring(1l); }
+    while !sanitized.isEmpty() && !isLowerAlnumNameChar(sanitized[0l]) { sanitized = sanitized.getSubstring(1l); }
     return sanitized;
 }
 
@@ -234,7 +233,7 @@ public f<bool> Dependency.equals(const Dependency& other) {
            this.github == other.github && this.rev == other.rev && this.path == other.path && this.dev == other.dev;
 }
 
-f<String> tomlString(const String& value) {
+f<String> tomlStringLiteral(const String& value) {
     TomlValue tomlValue = TomlValue(value);
     TomlSerializer serializer = TomlSerializer(true);
     return serializer.serializeValue(&tomlValue);
@@ -244,10 +243,10 @@ f<String> tomlString(const String& value) {
  * The value of the dependency as written to spice.toml: the short form for registry dependencies, an inline table otherwise
  */
 public f<String> Dependency.toToml() {
-    if this.source == DependencySource::REGISTRY { return tomlString(this.version); }
-    if this.source == DependencySource::PATH { return String("{ path = ") + tomlString(this.path) + " }"; }
-    String text = String("{ github = ") + tomlString(this.github);
-    if !this.rev.isEmpty() { text += String(", rev = ") + tomlString(this.rev); }
+    if this.source == DependencySource::REGISTRY { return tomlStringLiteral(this.version); }
+    if this.source == DependencySource::PATH { return String("{ path = ") + tomlStringLiteral(this.path) + " }"; }
+    String text = String("{ github = ") + tomlStringLiteral(this.github);
+    if !this.rev.isEmpty() { text += String(", rev = ") + tomlStringLiteral(this.rev); }
     return text + " }";
 }
 
@@ -284,7 +283,52 @@ public f<bool> Manifest.hasDependencies() {
 // Reading and validation
 // ---------------------------------------------------------------------------------------------------------------------
 
-f<string> kindName(TomlValue* value) {
+f<bool> isKnownManifestKey(const Vector<String>& list, const String& value) {
+    for unsigned long i = 0l; i < list.getSize(); i++ {
+        if list.get(i) == value { return true; }
+    }
+    return false;
+}
+
+/**
+ * Levenshtein distance, used to suggest the right key for a typo
+ */
+f<unsigned long> keyEditDistance(const String& a, const String& b) {
+    const unsigned long n = b.getLength();
+    Vector<unsigned long> row;
+    for unsigned long j = 0l; j <= n; j++ { row.pushBack(j); }
+    for unsigned long i = 1l; i <= a.getLength(); i++ {
+        unsigned long diagonal = row.get(0l);
+        row[0l] = i;
+        for unsigned long j = 1l; j <= n; j++ {
+            const unsigned long above = row.get(j);
+            unsigned long best = diagonal + (a[i - 1l] == b[j - 1l] ? 0l : 1l);
+            if above + 1l < best { best = above + 1l; }
+            if row.get(j - 1l) + 1l < best { best = row.get(j - 1l) + 1l; }
+            row[j] = best;
+            diagonal = above;
+        }
+    }
+    return row.get(n);
+}
+
+/**
+ * The candidate closest to the input, if it is at most two edits away. Empty otherwise.
+ */
+f<String> closestManifestKey(const String& input, const Vector<String>& candidates) {
+    String best;
+    unsigned long bestDistance = 3l;
+    for unsigned long i = 0l; i < candidates.getSize(); i++ {
+        const unsigned long distance = keyEditDistance(input, candidates.get(i));
+        if distance < bestDistance {
+            bestDistance = distance;
+            best = candidates.get(i);
+        }
+    }
+    return best;
+}
+
+f<string> tomlKindName(TomlValue* value) {
     if value.isString() { return "a string"; }
     if value.isInteger() { return "an integer"; }
     if value.isFloat() { return "a float"; }
@@ -294,19 +338,19 @@ f<string> kindName(TomlValue* value) {
     return "a table";
 }
 
-f<Vector<String>> keyList(string commaSeparated) {
+f<Vector<String>> manifestKeyList(string commaSeparated) {
     return split(String(commaSeparated), ',');
 }
 
 /**
  * Report every key of the table that is not in the list of known keys
  */
-p checkKeys(TomlValue* table, const Vector<String>& known, const String& where, Vector<String>& errors) {
+p checkManifestKeys(TomlValue* table, const Vector<String>& known, const String& where, Vector<String>& errors) {
     for unsigned long i = 0l; i < table.getTableSize(); i++ {
         const String& key = table.getTableKey(i);
-        if containsString(known, key) { continue; }
+        if isKnownManifestKey(known, key) { continue; }
         String message = where + "unknown key '" + key + "'";
-        const String suggestion = closestMatch(key, known);
+        const String suggestion = closestManifestKey(key, known);
         if !suggestion.isEmpty() { message += String(" (did you mean '") + suggestion + "'?)"; }
         errors.pushBack(message);
     }
@@ -316,11 +360,11 @@ p checkKeys(TomlValue* table, const Vector<String>& known, const String& where, 
  * Read an optional string. Returns false if the key is missing or has another type (which is reported).
  */
 #[ignoreUnusedReturnValue]
-f<bool> readString(TomlValue* table, string key, const String& where, String& target, Vector<String>& errors) {
+f<bool> readManifestString(TomlValue* table, string key, const String& where, String& target, Vector<String>& errors) {
     TomlValue* value = table.getFieldOrNil(key);
     if value == nil<TomlValue*> { return false; }
     if !value.isString() {
-        errors.pushBack(where + "'" + key + "' has to be a string, not " + kindName(value));
+        errors.pushBack(where + "'" + key + "' has to be a string, not " + tomlKindName(value));
         return false;
     }
     target = value.getString();
@@ -329,33 +373,33 @@ f<bool> readString(TomlValue* table, string key, const String& where, String& ta
 
 p parsePackageTable(TomlValue* table, const String& label, Manifest& manifest, Vector<String>& errors) {
     const String where = label + ": [package] ";
-    checkKeys(table, keyList(PACKAGE_KEYS), where, errors);
+    checkManifestKeys(table, manifestKeyList(PACKAGE_KEYS), where, errors);
 
-    if !readString(table, "name", where, manifest.name, errors) {
+    if !readManifestString(table, "name", where, manifest.name, errors) {
         if !table.hasField("name") { errors.pushBack(where + "'name' is missing"); }
     } else if !isValidPackageName(manifest.name) {
         errors.pushBack(where + "'name' is not a valid package name: lower-case letters, digits, '-' and '_', starting with " +
                         "a letter or digit");
     }
-    if !readString(table, "version", where, manifest.version, errors) {
+    if !readManifestString(table, "version", where, manifest.version, errors) {
         if !table.hasField("version") { errors.pushBack(where + "'version' is missing"); }
     } else if !isStrictSemver(manifest.version) {
         errors.pushBack(where + "'version' is not a valid semantic version like 1.2.3");
     }
-    readString(table, "description", where, manifest.description, errors);
-    readString(table, "license", where, manifest.license, errors);
-    readString(table, "repository", where, manifest.repository, errors);
-    readString(table, "homepage", where, manifest.homepage, errors);
-    if readString(table, "spice", where, manifest.spice, errors) && !isValidConstraint(manifest.spice) {
+    readManifestString(table, "description", where, manifest.description, errors);
+    readManifestString(table, "license", where, manifest.license, errors);
+    readManifestString(table, "repository", where, manifest.repository, errors);
+    readManifestString(table, "homepage", where, manifest.homepage, errors);
+    if readManifestString(table, "spice", where, manifest.spice, errors) && !isValidConstraint(manifest.spice) {
         errors.pushBack(where + "'spice' is not a valid version constraint");
     }
-    if readString(table, "entry", where, manifest.entry, errors) && !isValidEntry(manifest.entry) {
+    if readManifestString(table, "entry", where, manifest.entry, errors) && !isValidEntry(manifest.entry) {
         errors.pushBack(where + "'entry' has to be a relative path with '/' as separator, without '..', ending in .spice");
     }
     TomlValue* authors = table.getFieldOrNil("authors");
     if authors != nil<TomlValue*> {
         if !authors.isArray() {
-            errors.pushBack(where + "'authors' has to be an array of strings, not " + kindName(authors));
+            errors.pushBack(where + "'authors' has to be an array of strings, not " + tomlKindName(authors));
         } else {
             for unsigned long i = 0l; i < authors.getArraySize(); i++ {
                 TomlValue* author = authors.getArrayItem(i);
@@ -366,7 +410,7 @@ p parsePackageTable(TomlValue* table, const String& label, Manifest& manifest, V
     }
 }
 
-f<bool> parseDependency(const String& name, TomlValue* value, bool dev, const String& section, Dependency& dep,
+f<bool> parseDependencySpec(const String& name, TomlValue* value, bool dev, const String& section, Dependency& dep,
                         Vector<String>& errors) {
     const String where = section + name + ": ";
     const unsigned long errorCount = errors.getSize();
@@ -380,14 +424,14 @@ f<bool> parseDependency(const String& name, TomlValue* value, bool dev, const St
         dep.version = value.getString();
         if !isValidConstraint(dep.version) { errors.pushBack(where + "'" + dep.version + "' is not a valid version constraint"); }
     } else if !value.isTable() {
-        errors.pushBack(where + "has to be a version constraint or an inline table, not " + kindName(value));
+        errors.pushBack(where + "has to be a version constraint or an inline table, not " + tomlKindName(value));
         return false;
     } else {
-        checkKeys(value, keyList(DEPENDENCY_KEYS), where, errors);
-        const bool hasVersion = readString(value, "version", where, dep.version, errors);
-        const bool hasGithub = readString(value, "github", where, dep.github, errors);
-        const bool hasRev = readString(value, "rev", where, dep.rev, errors);
-        const bool hasPath = readString(value, "path", where, dep.path, errors);
+        checkManifestKeys(value, manifestKeyList(DEPENDENCY_KEYS), where, errors);
+        const bool hasVersion = readManifestString(value, "version", where, dep.version, errors);
+        const bool hasGithub = readManifestString(value, "github", where, dep.github, errors);
+        const bool hasRev = readManifestString(value, "rev", where, dep.rev, errors);
+        const bool hasPath = readManifestString(value, "path", where, dep.path, errors);
         const int sources = (hasVersion ? 1 : 0) + (hasGithub ? 1 : 0) + (hasPath ? 1 : 0);
         if sources == 0 {
             errors.pushBack(where + "needs one of 'version', 'github' or 'path'");
@@ -422,7 +466,7 @@ p parseDependencyTable(TomlValue* table, bool dev, const String& label, Manifest
         const String& name = table.getTableKey(i);
         TomlValue* value = table.getTableValue(i);
         Dependency dep;
-        if !parseDependency(name, value, dev, section, dep, errors) { continue; }
+        if !parseDependencySpec(name, value, dev, section, dep, errors) { continue; }
         if manifest.indexOf(name) >= 0l {
             errors.pushBack(section + name + ": listed in both [dependencies] and [dev-dependencies]");
             continue;
@@ -434,7 +478,7 @@ p parseDependencyTable(TomlValue* table, bool dev, const String& label, Manifest
 /**
  * Check that every dependency is a single line in its section, as the editing of the file requires
  */
-p checkLayout(const String& text, const String& label, Manifest& manifest, Vector<String>& errors) {
+p checkManifestLayout(const String& text, const String& label, Manifest& manifest, Vector<String>& errors) {
     const ManifestLayout layout = scanManifest(text);
     for unsigned long i = 0l; i < layout.problems.getSize(); i++ { errors.pushBack(label + ": " + layout.problems.get(i)); }
     for unsigned long i = 0l; i < manifest.dependencies.getSize(); i++ {
@@ -473,7 +517,7 @@ public f<bool> parseManifest(const String& text, const String& label, Manifest& 
         return false;
     }
     TomlValue* root = parsed.unwrap();
-    checkKeys(root, keyList(TOP_LEVEL_KEYS), label + ": ", errors);
+    checkManifestKeys(root, manifestKeyList(TOP_LEVEL_KEYS), label + ": ", errors);
 
     TomlValue* packageTable = root.getFieldOrNil(TABLE_PACKAGE);
     if packageTable == nil<TomlValue*> {
@@ -493,7 +537,7 @@ public f<bool> parseManifest(const String& text, const String& label, Manifest& 
         }
         parseDependencyTable(table, dev, label, manifest, errors);
     }
-    const Vector<String> otherTables = keyList("lint,format,tool");
+    const Vector<String> otherTables = manifestKeyList("lint,format,tool");
     for unsigned long i = 0l; i < otherTables.getSize(); i++ {
         const String& name = otherTables.get(i);
         TomlValue* table = root.getFieldOrNil(name.getRaw());
@@ -501,7 +545,7 @@ public f<bool> parseManifest(const String& text, const String& label, Manifest& 
     }
     deleteTomlValue(root);
 
-    if errors.getSize() == errorCount { checkLayout(text, label, manifest, errors); }
+    if errors.getSize() == errorCount { checkManifestLayout(text, label, manifest, errors); }
     return errors.getSize() == errorCount;
 }
 
@@ -509,7 +553,7 @@ public f<bool> parseManifest(const String& text, const String& label, Manifest& 
 // Writing
 // ---------------------------------------------------------------------------------------------------------------------
 
-p addStringField(TomlValue* table, string key, const String& value) {
+p addManifestStringField(TomlValue* table, string key, const String& value) {
     if !value.isEmpty() { table.addTableField(String(key), __new<TomlValue>(value)); }
 }
 
@@ -519,19 +563,19 @@ p addStringField(TomlValue* table, string key, const String& value) {
 public f<String> renderManifest(const Manifest& manifest) {
     TomlValue* root = __new<TomlValue>(TomlValueKind::TOML_TABLE);
     TomlValue* packageTable = __new<TomlValue>(TomlValueKind::TOML_TABLE);
-    addStringField(packageTable, "name", manifest.name);
-    addStringField(packageTable, "version", manifest.version);
-    addStringField(packageTable, "description", manifest.description);
-    addStringField(packageTable, "license", manifest.license);
+    addManifestStringField(packageTable, "name", manifest.name);
+    addManifestStringField(packageTable, "version", manifest.version);
+    addManifestStringField(packageTable, "description", manifest.description);
+    addManifestStringField(packageTable, "license", manifest.license);
     if manifest.authors.getSize() > 0l {
         TomlValue* authors = __new<TomlValue>(TomlValueKind::TOML_ARRAY);
         for unsigned long i = 0l; i < manifest.authors.getSize(); i++ { authors.addArrayItem(__new<TomlValue>(manifest.authors.get(i))); }
         packageTable.addTableField(String("authors"), authors);
     }
-    addStringField(packageTable, "repository", manifest.repository);
-    addStringField(packageTable, "homepage", manifest.homepage);
-    addStringField(packageTable, "spice", manifest.spice);
-    addStringField(packageTable, "entry", manifest.entry);
+    addManifestStringField(packageTable, "repository", manifest.repository);
+    addManifestStringField(packageTable, "homepage", manifest.homepage);
+    addManifestStringField(packageTable, "spice", manifest.spice);
+    addManifestStringField(packageTable, "entry", manifest.entry);
     root.addTableField(String(TABLE_PACKAGE), packageTable);
     // The dependencies are added line by line below, so that they get the one-line form
     root.addTableField(String(TABLE_DEPENDENCIES), __new<TomlValue>(TomlValueKind::TOML_TABLE));
@@ -600,10 +644,24 @@ public f<bool> Manifest.removeDependency(const String& name, Vector<String>& err
 
 // ============================================================== Tests ==============================================================
 
-f<String> joinErrors(const Vector<String>& errors) {
+f<String> joinManifestErrors(const Vector<String>& errors) {
     String all;
     for unsigned long i = 0l; i < errors.getSize(); i++ { all += errors.get(i) + "\n"; }
     return all;
+}
+
+#[test]
+f<bool> testKeySuggestions() {
+    assert keyEditDistance(String("verison"), String("version")) == 2l;
+    assert keyEditDistance(String(""), String("abc")) == 3l;
+    Vector<String> keys;
+    keys.pushBack(String("version"));
+    keys.pushBack(String("github"));
+    assert closestManifestKey(String("verison"), keys) == "version";
+    const String noMatch = closestManifestKey(String("completely-different"), keys);
+    assert noMatch.isEmpty();
+    assert isKnownManifestKey(keys, String("github")) && !isKnownManifestKey(keys, String("git"));
+    return true;
 }
 
 #[test]
@@ -676,7 +734,7 @@ f<bool> testManifestErrors() {
     Manifest manifest;
     Vector<String> errors;
     assert !parseManifest(text, String("spice.toml"), manifest, errors);
-    const String all = joinErrors(errors);
+    const String all = joinManifestErrors(errors);
     assert all.contains("[package] 'name' is not a valid package name");
     assert all.contains("unknown key 'verison' (did you mean 'version'?)");
     assert all.contains("'version' is missing");
@@ -703,7 +761,7 @@ f<bool> testManifestErrors() {
     Vector<String> wrongTablesErrors;
     assert !parseManifest(String("lint = 1\nformat = \"x\"\ntool = []\n[package]\nname = \"a\"\nversion = \"1.0.0\"\n"),
                           String("spice.toml"), wrongTables, wrongTablesErrors);
-    const String wrongTablesAll = joinErrors(wrongTablesErrors);
+    const String wrongTablesAll = joinManifestErrors(wrongTablesErrors);
     assert wrongTablesAll.contains("'lint' has to be a table");
     assert wrongTablesAll.contains("'format' has to be a table");
     assert wrongTablesAll.contains("'tool' has to be a table");

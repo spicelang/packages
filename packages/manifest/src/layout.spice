@@ -3,9 +3,6 @@ import "std/data/vector";
 import "std/text/analysis";
 import "std/type/type-conversion";
 
-// Own imports
-import "./text";
-
 // ---------------------------------------------------------------------------------------------------------------------
 // Line-level view of spice.toml, used to edit dependencies without touching anything else in the file.
 //
@@ -39,6 +36,34 @@ public type ManifestLayout struct {
 type LexState struct {
     public String openMultiline // `"""` or `'''` while inside a multi-line string, empty otherwise
     public long depth = 0l      // Nesting of brackets and braces, so that multi-line arrays are not mistaken for headers
+}
+
+/**
+ * Lines of a text without their line breaks. A trailing line break does not produce an empty last line.
+ */
+f<Vector<String>> splitManifestLines(const String& text) {
+    Vector<String> lines;
+    String current;
+    for unsigned long i = 0l; i < text.getLength(); i++ {
+        const char c = text[i];
+        if c == '\n' {
+            lines.pushBack(current);
+            current = String("");
+        } else if c != '\r' {
+            current.append(c);
+        }
+    }
+    if !current.isEmpty() { lines.pushBack(current); }
+    return lines;
+}
+
+f<String> joinManifestLines(const Vector<String>& lines) {
+    String text;
+    for unsigned long i = 0l; i < lines.getSize(); i++ {
+        text += lines.get(i);
+        text += "\n";
+    }
+    return text;
 }
 
 f<bool> isBareKeyChar(char c) {
@@ -120,7 +145,7 @@ f<String> headerName(const String& trimmed) {
 
 public f<ManifestLayout> scanManifest(const String& text) {
     ManifestLayout layout;
-    layout.lines = splitLines(text);
+    layout.lines = splitManifestLines(text);
     LexState state;
     String section;
     for unsigned long lineIdx = 0l; lineIdx < layout.lines.getSize(); lineIdx++ {
@@ -206,7 +231,7 @@ public f<String> removeDependencyLine(const String& text, const String& name) {
     const long idx = layout.indexOf(name);
     if idx < 0l { return text; }
     const DependencyLine& entry = layout.entries.get(cast<unsigned long>(idx));
-    return joinLines(withLine(layout.lines, entry.line, String(""), false));
+    return joinManifestLines(withLine(layout.lines, entry.line, String(""), false));
 }
 
 /**
@@ -221,7 +246,7 @@ public f<String> setDependencyLine(const String& text, const String& name, const
         if entry.dev == dev {
             const String& line = layout.lines.get(entry.line);
             const String updated = line.getSubstring(0l, cast<long>(entry.valueStart)) + value + line.getSubstring(entry.valueEnd);
-            return joinLines(withLine(layout.lines, entry.line, updated, true));
+            return joinManifestLines(withLine(layout.lines, entry.line, updated, true));
         }
         layout = scanManifest(removeDependencyLine(text, name));
     }
@@ -237,7 +262,7 @@ public f<String> setDependencyLine(const String& text, const String& name, const
         }
         lines.pushBack(String("[") + (dev ? SECTION_DEV_DEPENDENCIES : SECTION_DEPENDENCIES) + "]");
         lines.pushBack(newLine);
-        return joinLines(lines);
+        return joinManifestLines(lines);
     }
     // Insert after the last dependency of the section, or right after the header if it has none
     unsigned long insertAfter = cast<unsigned long>(header);
@@ -247,7 +272,7 @@ public f<String> setDependencyLine(const String& text, const String& name, const
     }
     Vector<String> lines = layout.lines;
     lines.insertAt(insertAfter + 1l, newLine);
-    return joinLines(lines);
+    return joinManifestLines(lines);
 }
 
 #[test]
@@ -280,6 +305,14 @@ f<bool> testScanManifestProblems() {
     assert quoted.problems.getSize() == 1l;
     const ManifestLayout subTable = scanManifest(String("[dependencies.a]\nversion = \"1\"\n"));
     assert subTable.problems.getSize() == 1l;
+    return true;
+}
+
+#[test]
+f<bool> testManifestLines() {
+    const Vector<String> lines = splitManifestLines(String("a\r\n\nb\n"));
+    assert lines.getSize() == 3l && lines.get(1l) == "" && lines.get(2l) == "b";
+    assert joinManifestLines(lines) == "a\n\nb\n";
     return true;
 }
 

@@ -1,0 +1,173 @@
+// Std imports
+import "std/data/vector";
+import "std/io/dir";
+import "std/io/file";
+import "std/io/filepath";
+import "std/os/filesystem";
+import "std/time/time";
+import "std/type/type-conversion";
+
+// Own imports
+import "manifest";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reading, writing and finding spice.toml on disk. The rest of the package does no I/O and is in manifest.spice.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Read and validate a spice.toml from disk. `label` names the file in the messages, which are appended to `errors`.
+ * Returns false if it cannot be read or is invalid; see parseManifest.
+ */
+public f<bool> loadManifest(const String& path, const String& label, Manifest& manifest, Vector<String>& errors) {
+    Result<String> content = readFile(path.getRaw());
+    if content.isErr() {
+        errors.pushBack(String("Could not read ") + label);
+        return false;
+    }
+    return parseManifest(content.unwrap(), label, manifest, errors);
+}
+
+/**
+ * Write the text of the manifest to disk. Line breaks are written as they are on every platform.
+ */
+public f<bool> saveManifest(const Manifest& manifest, const String& path = String(MANIFEST_FILE)) {
+    Result<File> opened = openFile(path.getRaw(), "wb");
+    if opened.isErr() { return false; }
+    File& file = opened.unwrap();
+    bool written = true;
+    for unsigned long i = 0l; i < manifest.text.getLength() && written; i++ { written = file.write(manifest.text[i]); }
+    return file.close() && written;
+}
+
+/**
+ * Make the given path absolute by prepending the working dir, if it is relative, and normalize it lexically
+ */
+public f<FilePath> makeAbsolutePath(const FilePath& path) {
+    if path.isAbsolute() {
+        return path.lexicallyNormal();
+    }
+    const FilePath absolutePath = FilePath(getCurrentWorkingDir()) / path;
+    return absolutePath.lexicallyNormal();
+}
+
+/**
+ * Get the parent dir of the given absolute and lexically normal path. Unlike FilePath.getParentDir, the parent of an entry
+ * directly below the root is the root, e.g. '/' for '/home' or 'C:/' for 'C:/Users'
+ *
+ * @return Parent dir or an empty path, if the given path is the root
+ */
+public f<FilePath> getAbsoluteParentDir(const FilePath& path) {
+    FilePath pathCopy = path;
+    String parentDir = pathCopy.getParentDir();
+    // The separator of the root is cut off together with the last component
+    if parentDir.isEmpty() || parentDir.endsWith(":") {
+        parentDir += "/";
+    }
+    const FilePath parentPath = FilePath(parentDir);
+    return parentPath == pathCopy ? FilePath() : parentPath;
+}
+
+/**
+ * Find the manifest of the project, that the given source file or dir belongs to: the spice.toml file in the dir of the given
+ * path or in the nearest of its parent dirs. The parent dirs are determined lexically, like a shell does it for 'cd ..', so that
+ * a symlinked dir is searched from the location, where it is linked, rather than from its target.
+ *
+ * @param path Path of a source file or dir
+ * @return Absolute path of the manifest or an empty path, if there is none
+ */
+public f<FilePath> findManifest(const FilePath& path) {
+    // Make the path absolute, so that the search can continue above the working dir up to the root
+    FilePath dir = makeAbsolutePath(path);
+    if !dirExists(dir.toString()) {
+        dir = getAbsoluteParentDir(dir);
+    }
+    while !dir.isEmpty() {
+        const FilePath candidate = dir / MANIFEST_FILE;
+        if fileExists(candidate.toString()) && !dirExists(candidate.toString()) {
+            return candidate;
+        }
+        dir = getAbsoluteParentDir(dir);
+    }
+    return FilePath();
+}
+
+/**
+ * Path of a manifest for messages, relative to the given base dir like the code locations of the compiler: './' for paths
+ * within the base dir, '../' for paths above it and the path as given, if there is no relative one (e.g. on another drive)
+ */
+public f<String> manifestDisplayPath(const FilePath& path, const FilePath& baseDir) {
+    const FilePath relativePath = makeAbsolutePath(path).lexicallyRelative(makeAbsolutePath(baseDir));
+    const String relativePathStr = String(relativePath.toGenericString());
+    if relativePath.isEmpty() {
+        return String(path.toGenericString());
+    }
+    if relativePathStr.startsWith("../") {
+        return relativePathStr;
+    }
+    return "./" + relativePathStr;
+}
+
+// ============================================================== Tests ==============================================================
+
+#[test]
+f<bool> testManifestFiles() {
+    const String dirName = String("spice-manifest-test-") + toString(getCurrentMicros());
+    const FilePath testDir = FilePath(getTempDir()) / dirName;
+    const FilePath subDir = testDir / "src" / "sub";
+    assert mkDirs(subDir.toString(), MODE_ALL_RWX) == 0;
+    const FilePath sourceFile = subDir / "main.spice";
+    const Result<bool> sourceWritten = writeFile(sourceFile.toString(), "f<int> main() {}\n");
+    assert sourceWritten.isOk();
+
+    // Without manifest, none is found (unless the temp dir is below a project, which it should not be)
+    const FilePath noManifest = findManifest(sourceFile);
+
+    // The manifest in a parent dir is found, from a file and from a dir
+    const FilePath manifestPath = testDir / MANIFEST_FILE;
+    Manifest manifest;
+    manifest.name = String("test");
+    manifest.version = String("1.0.0");
+    manifest.text = renderManifest(manifest);
+    const bool saved = saveManifest(manifest, String(manifestPath.toString()));
+    const FilePath fromFile = findManifest(sourceFile);
+    const FilePath fromDir = findManifest(subDir);
+    Manifest loaded;
+    Vector<String> errors;
+    const bool loadedOk = loadManifest(String(fromFile.toString()), String(MANIFEST_FILE), loaded, errors);
+    const String displayFromSubDir = manifestDisplayPath(fromFile, subDir);
+    const String displayFromTestDir = manifestDisplayPath(fromFile, testDir);
+    Manifest missing;
+    const bool missingOk = loadManifest(String((subDir / MANIFEST_FILE).toString()), String("missing"), missing, errors);
+
+    // Clean up before asserting, so that a failure does not leave the files behind
+    deleteFile(manifestPath.toString());
+    deleteFile(sourceFile.toString());
+    rmDir(subDir.toString());
+    rmDir((testDir / "src").toString());
+    rmDir(testDir.toString());
+
+    assert noManifest.isEmpty();
+    assert saved && loadedOk;
+    assert loaded.name == "test" && loaded.version == "1.0.0";
+    assert fromFile.toGenericString() == fromDir.toGenericString();
+    assert String(fromFile.toGenericString()).endsWith("/spice.toml");
+    assert displayFromSubDir == "../../spice.toml";
+    assert displayFromTestDir == "./spice.toml";
+    assert !missingOk && errors.getSize() == 1l;
+    const String& missingError = errors.get(0l);
+    assert missingError == "Could not read missing";
+    return true;
+}
+
+#[test]
+f<bool> testManifestParentDirs() {
+    assert getAbsoluteParentDir(FilePath("/home/user")).toGenericString() == "/home";
+    assert getAbsoluteParentDir(FilePath("/home")).toGenericString() == "/";
+    assert getAbsoluteParentDir(FilePath("/")).isEmpty();
+    assert getAbsoluteParentDir(FilePath("C:/Users")).toGenericString() == "C:/";
+    assert getAbsoluteParentDir(FilePath("C:/")).isEmpty();
+    // The search starts at the root for a source file in the root
+    assert makeAbsolutePath(FilePath("/main.spice")).toGenericString() == "/main.spice";
+    assert makeAbsolutePath(FilePath("/")).toGenericString() == "/";
+    return true;
+}

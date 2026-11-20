@@ -16,7 +16,7 @@ permissions:
 jobs:
   detect:
     name: Detect changed packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
 
@@ -41,6 +41,7 @@ jobs:
     name: Test ${{ matrix.name }}
     needs: detect
     if: needs.detect.outputs.matrix != '[]'
+    # Not ubuntu-slim, because building LLVM and compiling the packages needs more than its single core and 15 minute limit
     runs-on: ubuntu-latest
     strategy:
       # All packages are tested, even if one of them fails
@@ -109,7 +110,7 @@ jobs:
     name: CI result
     needs: [detect, test]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
 
     steps:
       - name: Check results

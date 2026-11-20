@@ -1,0 +1,759 @@
+// Std imports
+import "std/data/vector";
+import "std/text/analysis";
+import "std/text/format";
+import "std/text/string-ext";
+import "std/text/toml/toml-parser";
+import "std/text/toml/toml-serializer";
+import "std/text/toml/toml-value";
+
+// Package imports
+import "@/spice_packages/semver/semver";
+
+// Own imports
+import "src/layout";
+import "src/text";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The project manifest spice.toml of Spice packages: model, validation and editing. The format is specified in the README.
+//
+// This module does no I/O, so that it also works where there is no file system, e.g. in WebAssembly. Reading, writing
+// and finding manifests on disk is in manifest-file.spice.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Constants
+public const string MANIFEST_FILE = "spice.toml";
+public const string LOCK_FILE = "spice.lock";
+public const string PACKAGES_DIR = "spice_packages";
+public const string DEFAULT_ENTRY = "src/main.spice";
+public const unsigned long MAX_NAME_LENGTH = 64l;
+public const unsigned long MIN_REGISTRY_NAME_LENGTH = 2l;
+
+// Top-level tables
+public const string TABLE_PACKAGE = "package";
+public const string TABLE_DEPENDENCIES = "dependencies";
+public const string TABLE_DEV_DEPENDENCIES = "dev-dependencies";
+public const string TABLE_LINT = "lint";     // Linter of the compiler, validated by the compiler
+public const string TABLE_FORMAT = "format"; // Formatter of the compiler, validated by the compiler
+public const string TABLE_TOOL = "tool";     // Other tools, each in [tool.<its own name>]
+
+const string TOP_LEVEL_KEYS = "package,dependencies,dev-dependencies,lint,format,tool";
+const string PACKAGE_KEYS = "name,version,description,license,authors,repository,homepage,spice,entry";
+const string DEPENDENCY_KEYS = "version,github,rev,path";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------------------------------------------------
+
+f<bool> isLowerAlnum(char c) {
+    return isLower(c) || isDigit(c);
+}
+
+/**
+ * Package and dependency names: 1-64 lower-case letters, digits, '-' and '_', starting with a letter or digit.
+ * The name of a dependency is the name of its dir below spice_packages, so everything that ends up in a path or a command
+ * line has to pass this check.
+ */
+public f<bool> isValidPackageName(const String& name) {
+    const unsigned long len = name.getLength();
+    if len == 0l || len > MAX_NAME_LENGTH || !isLowerAlnum(name[0l]) { return false; }
+    for unsigned long i = 1l; i < len; i++ {
+        const char c = name[i];
+        if !isLowerAlnum(c) && c != '-' && c != '_' { return false; }
+    }
+    return true;
+}
+
+/**
+ * Names of packages in the registry are stricter than package names: lower kebab-case, 2-64 lower-case letters and digits
+ * in words separated by single '-'. They cannot start or end with '-'. Every valid registry name is a valid package name.
+ */
+public f<bool> isValidRegistryName(const String& name) {
+    const unsigned long len = name.getLength();
+    if len < MIN_REGISTRY_NAME_LENGTH || len > MAX_NAME_LENGTH || !isLowerAlnum(name[0l]) || !isLowerAlnum(name[len - 1l]) {
+        return false;
+    }
+    for unsigned long i = 1l; i < len; i++ {
+        const char c = name[i];
+        if c == '-' {
+            if name[i - 1l] == '-' { return false; }
+            continue;
+        }
+        if !isLowerAlnum(c) { return false; }
+    }
+    return true;
+}
+
+/**
+ * The rule of isValidRegistryName in words, for forms and error messages
+ */
+public f<String> registryNameRule() {
+    return String("registry names are lower kebab-case, like my-package: 2-64 lower-case letters and digits, separated by single hyphens");
+}
+
+/**
+ * Turn arbitrary text (a dir or repository name) into a valid package name. Empty, if nothing of it is usable.
+ */
+public f<String> sanitizeName(const String& input) {
+    const String lowered = toLower(input);
+    String sanitized;
+    for unsigned long i = 0l; i < lowered.getLength() && i < MAX_NAME_LENGTH; i++ {
+        const char c = lowered[i];
+        sanitized.append(isLowerAlnum(c) || c == '-' || c == '_' ? c : '-');
+    }
+    // The first character has to be a letter or digit
+    while !sanitized.isEmpty() && !isLowerAlnum(sanitized[0l]) { sanitized = sanitized.getSubstring(1l); }
+    return sanitized;
+}
+
+/**
+ * A GitHub user, organization or repository name: letters, digits, '-', '_' and '.'
+ */
+public f<bool> isValidGithubName(const String& name) {
+    const unsigned long len = name.getLength();
+    if len == 0l || len > 100l || name == "." || name == ".." { return false; }
+    for unsigned long i = 0l; i < len; i++ {
+        const char c = name[i];
+        if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' { return false; }
+    }
+    return true;
+}
+
+/**
+ * "owner/repo" with two valid GitHub names
+ */
+public f<bool> isValidGithubRepo(const String& ownerAndRepo) {
+    const long slash = ownerAndRepo.find('/');
+    if slash < 0l { return false; }
+    const String owner = ownerAndRepo.getSubstring(0l, slash);
+    const String repo = ownerAndRepo.getSubstring(cast<unsigned long>(slash) + 1l);
+    return isValidGithubName(owner) && isValidGithubName(repo);
+}
+
+/**
+ * A git ref (tag, branch or sha) that is safe to use in a URL
+ */
+public f<bool> isValidGitRef(const String& ref) {
+    const unsigned long len = ref.getLength();
+    if len == 0l || len > 100l || ref.contains("..") { return false; }
+    for unsigned long i = 0l; i < len; i++ {
+        const char c = ref[i];
+        if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' { return false; }
+    }
+    return true;
+}
+
+/**
+ * The entry of a package: a relative path with '/' as separator, without '..' components, ending in .spice
+ */
+public f<bool> isValidEntry(const String& entry) {
+    if entry.isEmpty() || entry.startsWith("/") || entry.contains("\\") || entry.contains(":") || !entry.endsWith(".spice") {
+        return false;
+    }
+    const Vector<String> parts = split(entry, '/');
+    for unsigned long i = 0l; i < parts.getSize(); i++ {
+        const String& part = parts.get(i);
+        if part.isEmpty() || part == ".." { return false; }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------------------------------------------------
+
+public type DependencySource enum {
+    REGISTRY,
+    GITHUB,
+    PATH
+}
+
+public type Dependency struct {
+    public String name
+    public DependencySource source = DependencySource::REGISTRY
+    public String version // Registry: version constraint
+    public String github  // GitHub: "owner/repo"
+    public String rev     // GitHub: tag, branch or sha; empty for the default branch
+    public String path    // Path: dir relative to the project root
+    public bool dev = false
+}
+
+public f<Dependency> registryDependency(const String& name, const String& constraint) {
+    Dependency dep;
+    dep.name = name;
+    dep.version = constraint;
+    return dep;
+}
+
+public f<Dependency> githubDependency(const String& name, const String& repo, const String& rev) {
+    Dependency dep;
+    dep.name = name;
+    dep.source = DependencySource::GITHUB;
+    dep.github = repo;
+    dep.rev = rev;
+    return dep;
+}
+
+public f<Dependency> pathDependency(const String& name, const String& path) {
+    Dependency dep;
+    dep.name = name;
+    dep.source = DependencySource::PATH;
+    dep.path = path;
+    return dep;
+}
+
+/**
+ * Identity of the source as recorded in the lock file: "registry", "github:owner/repo" or "path:<path>"
+ */
+public f<String> Dependency.sourceId() {
+    if this.source == DependencySource::GITHUB { return String("github:") + this.github; }
+    if this.source == DependencySource::PATH { return String("path:") + this.path; }
+    return String("registry");
+}
+
+/**
+ * The git ref of a GitHub dependency, "HEAD" for the default branch
+ */
+public f<String> Dependency.ref() {
+    return this.rev.isEmpty() ? String("HEAD") : this.rev;
+}
+
+/**
+ * Short human-readable form of the specification, e.g. "^1.2.0", "github:owner/repo#v1" or "path:../x"
+ */
+public f<String> Dependency.describe() {
+    if this.source == DependencySource::GITHUB {
+        return this.rev.isEmpty() ? this.sourceId() : this.sourceId() + "#" + this.rev;
+    }
+    if this.source == DependencySource::PATH { return this.sourceId(); }
+    return this.version;
+}
+
+public f<bool> Dependency.equals(const Dependency& other) {
+    return this.name == other.name && this.source == other.source && this.version == other.version &&
+           this.github == other.github && this.rev == other.rev && this.path == other.path && this.dev == other.dev;
+}
+
+f<String> tomlString(const String& value) {
+    TomlValue tomlValue = TomlValue(value);
+    TomlSerializer serializer = TomlSerializer(true);
+    return serializer.serializeValue(&tomlValue);
+}
+
+/**
+ * The value of the dependency as written to spice.toml: the short form for registry dependencies, an inline table otherwise
+ */
+public f<String> Dependency.toToml() {
+    if this.source == DependencySource::REGISTRY { return tomlString(this.version); }
+    if this.source == DependencySource::PATH { return String("{ path = ") + tomlString(this.path) + " }"; }
+    String text = String("{ github = ") + tomlString(this.github);
+    if !this.rev.isEmpty() { text += String(", rev = ") + tomlString(this.rev); }
+    return text + " }";
+}
+
+public type Manifest struct {
+    public String text // The file content, which edits are applied to
+    public String name
+    public String version
+    public String description
+    public String license
+    public Vector<String> authors
+    public String repository
+    public String homepage
+    public String spice   // Constraint on the compiler version, empty if there is none
+    public String entry   // Empty for the default
+    public Vector<Dependency> dependencies // [dependencies] first, then [dev-dependencies], each in file order
+}
+
+public f<String> Manifest.getEntry() {
+    return this.entry.isEmpty() ? String(DEFAULT_ENTRY) : this.entry;
+}
+
+public f<long> Manifest.indexOf(const String& name) {
+    for unsigned long i = 0l; i < this.dependencies.getSize(); i++ {
+        if this.dependencies.get(i).name == name { return cast<long>(i); }
+    }
+    return -1l;
+}
+
+public f<bool> Manifest.hasDependencies() {
+    return this.dependencies.getSize() > 0l;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Reading and validation
+// ---------------------------------------------------------------------------------------------------------------------
+
+f<string> kindName(TomlValue* value) {
+    if value.isString() { return "a string"; }
+    if value.isInteger() { return "an integer"; }
+    if value.isFloat() { return "a float"; }
+    if value.isBool() { return "a boolean"; }
+    if value.isDateTime() { return "a date-time"; }
+    if value.isArray() { return "an array"; }
+    return "a table";
+}
+
+f<Vector<String>> keyList(string commaSeparated) {
+    return split(String(commaSeparated), ',');
+}
+
+/**
+ * Report every key of the table that is not in the list of known keys
+ */
+p checkKeys(TomlValue* table, const Vector<String>& known, const String& where, Vector<String>& errors) {
+    for unsigned long i = 0l; i < table.getTableSize(); i++ {
+        const String& key = table.getTableKey(i);
+        if containsString(known, key) { continue; }
+        String message = where + "unknown key '" + key + "'";
+        const String suggestion = closestMatch(key, known);
+        if !suggestion.isEmpty() { message += String(" (did you mean '") + suggestion + "'?)"; }
+        errors.pushBack(message);
+    }
+}
+
+/**
+ * Read an optional string. Returns false if the key is missing or has another type (which is reported).
+ */
+#[ignoreUnusedReturnValue]
+f<bool> readString(TomlValue* table, string key, const String& where, String& target, Vector<String>& errors) {
+    TomlValue* value = table.getFieldOrNil(key);
+    if value == nil<TomlValue*> { return false; }
+    if !value.isString() {
+        errors.pushBack(where + "'" + key + "' has to be a string, not " + kindName(value));
+        return false;
+    }
+    target = value.getString();
+    return true;
+}
+
+p parsePackageTable(TomlValue* table, const String& label, Manifest& manifest, Vector<String>& errors) {
+    const String where = label + ": [package] ";
+    checkKeys(table, keyList(PACKAGE_KEYS), where, errors);
+
+    if !readString(table, "name", where, manifest.name, errors) {
+        if !table.hasField("name") { errors.pushBack(where + "'name' is missing"); }
+    } else if !isValidPackageName(manifest.name) {
+        errors.pushBack(where + "'name' is not a valid package name: lower-case letters, digits, '-' and '_', starting with " +
+                        "a letter or digit");
+    }
+    if !readString(table, "version", where, manifest.version, errors) {
+        if !table.hasField("version") { errors.pushBack(where + "'version' is missing"); }
+    } else if !isStrictSemver(manifest.version) {
+        errors.pushBack(where + "'version' is not a valid semantic version like 1.2.3");
+    }
+    readString(table, "description", where, manifest.description, errors);
+    readString(table, "license", where, manifest.license, errors);
+    readString(table, "repository", where, manifest.repository, errors);
+    readString(table, "homepage", where, manifest.homepage, errors);
+    if readString(table, "spice", where, manifest.spice, errors) && !isValidConstraint(manifest.spice) {
+        errors.pushBack(where + "'spice' is not a valid version constraint");
+    }
+    if readString(table, "entry", where, manifest.entry, errors) && !isValidEntry(manifest.entry) {
+        errors.pushBack(where + "'entry' has to be a relative path with '/' as separator, without '..', ending in .spice");
+    }
+    TomlValue* authors = table.getFieldOrNil("authors");
+    if authors != nil<TomlValue*> {
+        if !authors.isArray() {
+            errors.pushBack(where + "'authors' has to be an array of strings, not " + kindName(authors));
+        } else {
+            for unsigned long i = 0l; i < authors.getArraySize(); i++ {
+                TomlValue* author = authors.getArrayItem(i);
+                if author.isString() { manifest.authors.pushBack(author.getString()); }
+                else { errors.pushBack(where + "'authors' has to be an array of strings"); break; }
+            }
+        }
+    }
+}
+
+f<bool> parseDependency(const String& name, TomlValue* value, bool dev, const String& section, Dependency& dep,
+                        Vector<String>& errors) {
+    const String where = section + name + ": ";
+    const unsigned long errorCount = errors.getSize();
+    dep.name = name;
+    dep.dev = dev;
+    if !isValidPackageName(name) {
+        errors.pushBack(where + "not a valid dependency name: lower-case letters, digits, '-' and '_', starting with a letter " +
+                        "or digit");
+    }
+    if value.isString() {
+        dep.version = value.getString();
+        if !isValidConstraint(dep.version) { errors.pushBack(where + "'" + dep.version + "' is not a valid version constraint"); }
+    } else if !value.isTable() {
+        errors.pushBack(where + "has to be a version constraint or an inline table, not " + kindName(value));
+        return false;
+    } else {
+        checkKeys(value, keyList(DEPENDENCY_KEYS), where, errors);
+        const bool hasVersion = readString(value, "version", where, dep.version, errors);
+        const bool hasGithub = readString(value, "github", where, dep.github, errors);
+        const bool hasRev = readString(value, "rev", where, dep.rev, errors);
+        const bool hasPath = readString(value, "path", where, dep.path, errors);
+        const int sources = (hasVersion ? 1 : 0) + (hasGithub ? 1 : 0) + (hasPath ? 1 : 0);
+        if sources == 0 {
+            errors.pushBack(where + "needs one of 'version', 'github' or 'path'");
+        } else if sources > 1 {
+            errors.pushBack(where + "has more than one of 'version', 'github' and 'path'");
+        }
+        if hasRev && !hasGithub { errors.pushBack(where + "'rev' is only allowed together with 'github'"); }
+        if hasVersion && !isValidConstraint(dep.version) {
+            errors.pushBack(where + "'" + dep.version + "' is not a valid version constraint");
+        }
+        if hasGithub {
+            dep.source = DependencySource::GITHUB;
+            if !isValidGithubRepo(dep.github) { errors.pushBack(where + "'github' has to be owner/repo"); }
+        }
+        if hasRev && !isValidGitRef(dep.rev) { errors.pushBack(where + "'rev' is not a valid git ref"); }
+        if hasPath {
+            dep.source = DependencySource::PATH;
+            if dep.path.isEmpty() || dep.path.contains("\\") { errors.pushBack(where + "'path' has to be a path with '/' as separator"); }
+        }
+    }
+    // The name of a registry dependency is the name of the package in the registry, so it has to follow the registry rule
+    if dep.source == DependencySource::REGISTRY && isValidPackageName(name) && !isValidRegistryName(name) {
+        errors.pushBack(where + "not a valid name for a registry package, " + registryNameRule() +
+                        ". Use 'github' or 'path' for other packages");
+    }
+    return errors.getSize() == errorCount;
+}
+
+p parseDependencyTable(TomlValue* table, bool dev, const String& label, Manifest& manifest, Vector<String>& errors) {
+    const String section = label + ": [" + (dev ? TABLE_DEV_DEPENDENCIES : TABLE_DEPENDENCIES) + "] ";
+    for unsigned long i = 0l; i < table.getTableSize(); i++ {
+        const String& name = table.getTableKey(i);
+        TomlValue* value = table.getTableValue(i);
+        Dependency dep;
+        if !parseDependency(name, value, dev, section, dep, errors) { continue; }
+        if manifest.indexOf(name) >= 0l {
+            errors.pushBack(section + name + ": listed in both [dependencies] and [dev-dependencies]");
+            continue;
+        }
+        manifest.dependencies.pushBack(dep);
+    }
+}
+
+/**
+ * Check that every dependency is a single line in its section, as the editing of the file requires
+ */
+p checkLayout(const String& text, const String& label, Manifest& manifest, Vector<String>& errors) {
+    const ManifestLayout layout = scanManifest(text);
+    for unsigned long i = 0l; i < layout.problems.getSize(); i++ { errors.pushBack(label + ": " + layout.problems.get(i)); }
+    for unsigned long i = 0l; i < manifest.dependencies.getSize(); i++ {
+        const Dependency& dep = manifest.dependencies.get(i);
+        const long idx = layout.indexOf(dep.name);
+        bool found = idx >= 0l;
+        if found {
+            const DependencyLine& line = layout.entries.get(cast<unsigned long>(idx));
+            found = line.dev == dep.dev;
+        }
+        if !found {
+            errors.pushBack(label + ": dependency '" + dep.name + "' has to be written as one line '" + dep.name +
+                            " = ...' below a [" + (dep.dev ? TABLE_DEV_DEPENDENCIES : TABLE_DEPENDENCIES) + "] header");
+        }
+    }
+}
+
+/**
+ * Parse and validate the content of a spice.toml. `label` names the file in the messages, which are appended to `errors`.
+ * Returns false if there were errors.
+ *
+ * The manifest is filled as far as possible even if there are errors: it holds every valid value and every dependency
+ * whose specification is valid on its own. Only for text that is no valid TOML it stays empty. So a tool that does not
+ * need a fully valid manifest (like the registry) can ignore the errors and use what was read.
+ *
+ * The contents of [lint] and [format] belong to the compiler and the contents of [tool] to other tools, so they are not
+ * validated here.
+ */
+public f<bool> parseManifest(const String& text, const String& label, Manifest& manifest, Vector<String>& errors) {
+    const unsigned long errorCount = errors.getSize();
+    manifest.text = text;
+    Result<TomlValue*> parsed = parseToml(text);
+    if parsed.isErr() {
+        const Error& error = parsed.getErr();
+        errors.pushBack(label + ": invalid TOML: " + error.getMessage());
+        return false;
+    }
+    TomlValue* root = parsed.unwrap();
+    checkKeys(root, keyList(TOP_LEVEL_KEYS), label + ": ", errors);
+
+    TomlValue* packageTable = root.getFieldOrNil(TABLE_PACKAGE);
+    if packageTable == nil<TomlValue*> {
+        errors.pushBack(label + ": the [package] table is missing");
+    } else if !packageTable.isTable() {
+        errors.pushBack(label + ": 'package' has to be a table");
+    } else {
+        parsePackageTable(packageTable, label, manifest, errors);
+    }
+    for int pass = 0; pass < 2; pass++ {
+        const bool dev = pass == 1;
+        TomlValue* table = root.getFieldOrNil(dev ? TABLE_DEV_DEPENDENCIES : TABLE_DEPENDENCIES);
+        if table == nil<TomlValue*> { continue; }
+        if !table.isTable() {
+            errors.pushBack(label + ": '" + (dev ? TABLE_DEV_DEPENDENCIES : TABLE_DEPENDENCIES) + "' has to be a table");
+            continue;
+        }
+        parseDependencyTable(table, dev, label, manifest, errors);
+    }
+    const Vector<String> otherTables = keyList("lint,format,tool");
+    for unsigned long i = 0l; i < otherTables.getSize(); i++ {
+        const String& name = otherTables.get(i);
+        TomlValue* table = root.getFieldOrNil(name.getRaw());
+        if table != nil<TomlValue*> && !table.isTable() { errors.pushBack(label + ": '" + name + "' has to be a table"); }
+    }
+    deleteTomlValue(root);
+
+    if errors.getSize() == errorCount { checkLayout(text, label, manifest, errors); }
+    return errors.getSize() == errorCount;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------------------------------------------------
+
+p addStringField(TomlValue* table, string key, const String& value) {
+    if !value.isEmpty() { table.addTableField(String(key), __new<TomlValue>(value)); }
+}
+
+/**
+ * Text of a new spice.toml with the metadata and dependencies of the given manifest
+ */
+public f<String> renderManifest(const Manifest& manifest) {
+    TomlValue* root = __new<TomlValue>(TomlValueKind::TOML_TABLE);
+    TomlValue* packageTable = __new<TomlValue>(TomlValueKind::TOML_TABLE);
+    addStringField(packageTable, "name", manifest.name);
+    addStringField(packageTable, "version", manifest.version);
+    addStringField(packageTable, "description", manifest.description);
+    addStringField(packageTable, "license", manifest.license);
+    if manifest.authors.getSize() > 0l {
+        TomlValue* authors = __new<TomlValue>(TomlValueKind::TOML_ARRAY);
+        for unsigned long i = 0l; i < manifest.authors.getSize(); i++ { authors.addArrayItem(__new<TomlValue>(manifest.authors.get(i))); }
+        packageTable.addTableField(String("authors"), authors);
+    }
+    addStringField(packageTable, "repository", manifest.repository);
+    addStringField(packageTable, "homepage", manifest.homepage);
+    addStringField(packageTable, "spice", manifest.spice);
+    addStringField(packageTable, "entry", manifest.entry);
+    root.addTableField(String(TABLE_PACKAGE), packageTable);
+    // The dependencies are added line by line below, so that they get the one-line form
+    root.addTableField(String(TABLE_DEPENDENCIES), __new<TomlValue>(TomlValueKind::TOML_TABLE));
+    TomlSerializer serializer;
+    String text = serializer.serialize(root);
+    deleteTomlValue(root);
+    for unsigned long i = 0l; i < manifest.dependencies.getSize(); i++ {
+        const Dependency& dep = manifest.dependencies.get(i);
+        text = setDependencyLine(text, dep.name, dep.toToml(), dep.dev);
+    }
+    return text;
+}
+
+/**
+ * Check that re-reading an edited text gives exactly the expected dependencies, and take it over if so
+ */
+f<bool> Manifest.adoptEdit(const String& newText, const Vector<Dependency>& expected, Vector<String>& errors) {
+    Manifest edited;
+    Vector<String> editErrors;
+    bool same = parseManifest(newText, String(MANIFEST_FILE), edited, editErrors);
+    same = same && edited.dependencies.getSize() == expected.getSize();
+    for unsigned long i = 0l; i < expected.getSize() && same; i++ {
+        const Dependency& want = expected.get(i);
+        const long idx = edited.indexOf(want.name);
+        same = idx >= 0l;
+        if same {
+            const Dependency& got = edited.dependencies.get(cast<unsigned long>(idx));
+            same = got.equals(want);
+        }
+    }
+    if !same {
+        errors.pushBack(String("Could not edit ") + MANIFEST_FILE + " safely, please change it by hand");
+        return false;
+    }
+    *this = edited;
+    return true;
+}
+
+/**
+ * Add a dependency or replace the one with the same name, which may also move it to the other table. Changes the text of
+ * the manifest in place, keeping comments and formatting, and verifies the result. Returns false if that failed.
+ */
+public f<bool> Manifest.setDependency(const Dependency& dep, Vector<String>& errors) {
+    Vector<Dependency> expected;
+    for unsigned long i = 0l; i < this.dependencies.getSize(); i++ {
+        const Dependency& existing = this.dependencies.get(i);
+        if existing.name != dep.name { expected.pushBack(existing); }
+    }
+    expected.pushBack(dep);
+    const String newText = setDependencyLine(this.text, dep.name, dep.toToml(), dep.dev);
+    return this.adoptEdit(newText, expected, errors);
+}
+
+/**
+ * Remove a dependency from the text of the manifest, keeping comments and formatting. Returns false if that failed.
+ */
+public f<bool> Manifest.removeDependency(const String& name, Vector<String>& errors) {
+    Vector<Dependency> expected;
+    for unsigned long i = 0l; i < this.dependencies.getSize(); i++ {
+        const Dependency& existing = this.dependencies.get(i);
+        if existing.name != name { expected.pushBack(existing); }
+    }
+    const String newText = removeDependencyLine(this.text, name);
+    return this.adoptEdit(newText, expected, errors);
+}
+
+// ============================================================== Tests ==============================================================
+
+f<String> joinErrors(const Vector<String>& errors) {
+    String all;
+    for unsigned long i = 0l; i < errors.getSize(); i++ { all += errors.get(i) + "\n"; }
+    return all;
+}
+
+#[test]
+f<bool> testNameValidation() {
+    assert isValidPackageName(String("json-parser_2"));
+    assert isValidPackageName(String("a"));
+    assert !isValidPackageName(String("Json"));
+    assert !isValidPackageName(String("-json"));
+    assert !isValidPackageName(String("a b"));
+    assert !isValidPackageName(String("$(rm)"));
+    assert isValidRegistryName(String("json-parser2"));
+    assert !isValidRegistryName(String("a"));
+    assert !isValidRegistryName(String("json_parser"));
+    assert !isValidRegistryName(String("json--parser"));
+    assert !isValidRegistryName(String("json-"));
+    assert sanitizeName(String("My.Repo Name")) == "my-repo-name";
+    assert sanitizeName(String("--x")) == "x";
+    assert isValidGithubName(String("spice.lang"));
+    assert !isValidGithubName(String(".."));
+    assert isValidGithubRepo(String("owner/Repo.x"));
+    assert !isValidGithubRepo(String("owner"));
+    assert !isValidGithubRepo(String("a/b/c"));
+    assert isValidGitRef(String("feature/x-1.2"));
+    assert !isValidGitRef(String("a;b"));
+    assert !isValidGitRef(String("a/../b"));
+    assert isValidEntry(String("src/lib.spice"));
+    assert !isValidEntry(String("../lib.spice"));
+    assert !isValidEntry(String("/lib.spice"));
+    assert !isValidEntry(String("lib.sp"));
+    return true;
+}
+
+#[test]
+f<bool> testParseManifest() {
+    const String text = String("[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nauthors = [\"A <a@b.c>\"]\nspice = \">=0.29.0\"\n") +
+                        "entry = \"src/lib.spice\"\n\n[dependencies]\njson-parser = \"^1.2.0\"\nhttp = { github = \"o/Http\", rev = \"v1\" }\n" +
+                        "local = { path = \"../local\" } # here\n\n[dev-dependencies]\ntest-kit = { version = \"~1.2.0\" }\n\n" +
+                        "[lint.rules]\nnaming-convention = { enabled = false }\n\n[format]\nindent-width = 2\n\n" +
+                        "[tool.linter]\nanything = [1, 2]\n";
+    Manifest manifest;
+    Vector<String> errors;
+    assert parseManifest(text, String("spice.toml"), manifest, errors);
+    assert manifest.name == "my-app" && manifest.version == "0.1.0" && manifest.spice == ">=0.29.0";
+    assert manifest.authors.getSize() == 1l;
+    assert manifest.getEntry() == "src/lib.spice";
+    assert manifest.dependencies.getSize() == 4l;
+    const Dependency& json = manifest.dependencies.get(0l);
+    assert json.source == DependencySource::REGISTRY && json.version == "^1.2.0" && !json.dev;
+    assert json.describe() == "^1.2.0" && json.sourceId() == "registry";
+    const Dependency& http = manifest.dependencies.get(1l);
+    assert http.source == DependencySource::GITHUB && http.github == "o/Http" && http.rev == "v1";
+    assert http.sourceId() == "github:o/Http" && http.describe() == "github:o/Http#v1" && http.ref() == "v1";
+    const Dependency& local = manifest.dependencies.get(2l);
+    assert local.source == DependencySource::PATH && local.path == "../local";
+    const Dependency& testKit = manifest.dependencies.get(3l);
+    assert testKit.dev && testKit.version == "~1.2.0";
+
+    Manifest minimal;
+    assert parseManifest(String("[package]\nname = \"a\"\nversion = \"1.0.0\"\n"), String("spice.toml"), minimal, errors);
+    assert minimal.getEntry() == DEFAULT_ENTRY && !minimal.hasDependencies();
+    assert errors.getSize() == 0l;
+    return true;
+}
+
+#[test]
+f<bool> testManifestErrors() {
+    const String text = String("[package]\nname = \"My App\"\nverison = \"1\"\n\n[dependencies]\naa = { github = \"x\", path = \"y\" }\n") +
+                        "b = { version = \"^1\", rev = \"x\" }\nc = 5\nd = \"not a constraint\"\nmy_pkg = \"^1.0.0\"\nx = \"1\"\n" +
+                        "\n[dev-dependencies]\naa = \"1\"\n\n[extra]\n\n[formats]\n";
+    Manifest manifest;
+    Vector<String> errors;
+    assert !parseManifest(text, String("spice.toml"), manifest, errors);
+    const String all = joinErrors(errors);
+    assert all.contains("[package] 'name' is not a valid package name");
+    assert all.contains("unknown key 'verison' (did you mean 'version'?)");
+    assert all.contains("'version' is missing");
+    assert all.contains("aa: has more than one of");
+    assert all.contains("b: 'rev' is only allowed together with 'github'");
+    assert all.contains("c: has to be a version constraint or an inline table, not an integer");
+    assert all.contains("d: 'not a constraint' is not a valid version constraint");
+    assert all.contains("my_pkg: not a valid name for a registry package");
+    assert all.contains("x: not a valid name for a registry package");
+    assert all.contains("spice.toml: unknown key 'extra'");
+    assert all.contains("spice.toml: unknown key 'formats' (did you mean 'format'?)");
+    // The valid parts are read nevertheless: the dev dependency 'aa', because the other 'aa' is invalid
+    assert manifest.dependencies.getSize() == 1l;
+    const Dependency& devA = manifest.dependencies.get(0l);
+    assert devA.name == "aa" && devA.dev;
+
+    // Names, that are no registry names, are fine for GitHub and path dependencies
+    Manifest other;
+    Vector<String> otherErrors;
+    assert parseManifest(String("[package]\nname = \"my_app\"\nversion = \"1.0.0\"\n[dependencies]\nmy_lib = { path = \"../my_lib\" }\n") +
+                         "x = { github = \"o/x\" }\n", String("spice.toml"), other, otherErrors);
+
+    Manifest wrongTables;
+    Vector<String> wrongTablesErrors;
+    assert !parseManifest(String("lint = 1\nformat = \"x\"\ntool = []\n[package]\nname = \"a\"\nversion = \"1.0.0\"\n"),
+                          String("spice.toml"), wrongTables, wrongTablesErrors);
+    const String wrongTablesAll = joinErrors(wrongTablesErrors);
+    assert wrongTablesAll.contains("'lint' has to be a table");
+    assert wrongTablesAll.contains("'format' has to be a table");
+    assert wrongTablesAll.contains("'tool' has to be a table");
+
+    Manifest dotted;
+    Vector<String> dottedErrors;
+    assert !parseManifest(String("[package]\nname = \"a\"\nversion = \"1.0.0\"\n[dependencies.b]\nversion = \"1\"\n"),
+                          String("spice.toml"), dotted, dottedErrors);
+    Manifest invalid;
+    Vector<String> invalidErrors;
+    assert !parseManifest(String("[package\n"), String("spice.toml"), invalid, invalidErrors);
+    const String& invalidMessage = invalidErrors.get(0l);
+    assert invalidMessage.startsWith("spice.toml: invalid TOML");
+    return true;
+}
+
+#[test]
+f<bool> testEditManifest() {
+    Manifest manifest;
+    Vector<String> errors;
+    assert parseManifest(String("# Mine\n[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\naa = \"^1.0.0\" # pinned\n"),
+                         String("spice.toml"), manifest, errors);
+    assert manifest.setDependency(githubDependency(String("bb"), String("o/b"), String("")), errors);
+    Dependency dev = registryDependency(String("aa"), String("^2.0.0"));
+    dev.dev = true;
+    assert manifest.setDependency(dev, errors);
+    assert manifest.text == "# Mine\n[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\nbb = { github = \"o/b\" }\n\n" +
+                            "[dev-dependencies]\naa = \"^2.0.0\"\n";
+    assert manifest.removeDependency(String("bb"), errors);
+    assert manifest.dependencies.getSize() == 1l;
+    assert errors.getSize() == 0l;
+    return true;
+}
+
+#[test]
+f<bool> testRenderManifest() {
+    Manifest manifest;
+    manifest.name = String("app");
+    manifest.version = String("0.1.0");
+    manifest.authors.pushBack(String("Me"));
+    const String initText = renderManifest(manifest);
+    assert initText == "[package]\nname = \"app\"\nversion = \"0.1.0\"\nauthors = [\"Me\"]\n\n[dependencies]\n";
+    manifest.dependencies.pushBack(pathDependency(String("x"), String("../x")));
+    Dependency dev = registryDependency(String("yy"), String("*"));
+    dev.dev = true;
+    manifest.dependencies.pushBack(dev);
+    const String text = renderManifest(manifest);
+    Manifest parsed;
+    Vector<String> errors;
+    assert parseManifest(text, String("spice.toml"), parsed, errors);
+    assert parsed.dependencies.getSize() == 2l;
+    return true;
+}

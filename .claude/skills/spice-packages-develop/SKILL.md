@@ -1,6 +1,6 @@
 ---
 name: spice-packages-develop
-description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, llvm, semver, sqlite, template, tpde) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler), the per-package `ci.toml` with CI requirements, unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
+description: Add a new official Spice package to spicelang/packages or change an existing one (github, gtk4, libcurl, llvm, manifest, semver, sqlite, template, tpde) — the per-package directory layout, `spice.toml` fields, entry file, README, binding packages that link system libraries via `core.*.linker.flag`, the repo files to update (root README table, labeler), the per-package `ci.toml` with CI requirements, unit tests and how to run them locally exactly like CI. Use when creating, extending or testing a package in this monorepo.
 ---
 
 # Develop a package in spicelang/packages
@@ -89,7 +89,7 @@ Each selected package gets its own job, that installs only what the package and 
 `ci.toml`, installs the **latest Spice release** and runs:
 
 ```sh
-cd packages/<name> && spice test -O0 <entry>
+cd packages/<name> && spice test -O0 <entry>   # or each file of `tests` in ci.toml
 ```
 
 `ci.toml` is optional; a package without system dependencies does not need one:
@@ -97,6 +97,7 @@ cd packages/<name> && spice test -O0 <entry>
 ```toml
 apt = ["libgtk-4-dev"]   # APT packages to install before the tests
 setup = ["llvm"]         # named setup steps of the workflow
+tests = ["other.spice"]  # files to run `spice test` on instead of the entry file
 ```
 
 A named setup step is a step in the `test` job of the workflow with `if: contains(matrix.setup, '<name>')` (named,

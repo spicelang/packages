@@ -93,10 +93,15 @@ jobs:
         uses: spicelang/spice-setup-action@v1
 
       - name: Run tests
+        # The entry file, or the files that the package lists as `tests` in its ci.toml (e.g. a module, that imports the entry
+        # file, to run the tests of both)
         working-directory: packages/${{ matrix.name }}
         env:
-          ENTRY: ${{ matrix.entry }}
-        run: spice test -O0 "$ENTRY"
+          TEST_FILES: ${{ join(matrix.tests, ' ') }}
+        run: |
+          for file in $TEST_FILES; do
+            spice test -O0 "$file"
+          done
 
   result:
     # Stable check for the branch protection, because the test jobs are named after the packages and skipped if no package

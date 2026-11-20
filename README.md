@@ -22,6 +22,7 @@ This is the home repo of the official packages for the [Spice programming langua
 | [gtk4](./packages/gtk4)         | Bindings for the GTK 4 GUI toolkit                                                              | [gtk4](https://rack.spicelang.com/packages/gtk4)         |
 | [libcurl](./packages/libcurl)   | Bindings for libcurl, used for network transfers that need https                                | [libcurl](https://rack.spicelang.com/packages/libcurl)   |
 | [llvm](./packages/llvm)         | Bindings for the LLVM C API, to build, optimize and emit LLVM IR                                | [llvm](https://rack.spicelang.com/packages/llvm)         |
+| [manifest](./packages/manifest) | Model, validation and comment-preserving editing of `spice.toml`, the manifest of packages    | [manifest](https://rack.spicelang.com/packages/manifest) |
 | [semver](./packages/semver)     | Semantic versions and version constraints (`^`, `~`, wildcards, ranges)                         | [semver](https://rack.spicelang.com/packages/semver)     |
 | [sqlite](./packages/sqlite)     | Bindings for SQLite, an embedded, file-based SQL database                                       | [sqlite](https://rack.spicelang.com/packages/sqlite)     |
 | [template](./packages/template) | HTML template engine with a Jinja-like syntax (inheritance, macros, includes, filters)          | [template](https://rack.spicelang.com/packages/template) |

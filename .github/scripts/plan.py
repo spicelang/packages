@@ -1,11 +1,13 @@
 """Computes the test matrix of the CI workflow.
 
 Selects the packages affected by the changes of the triggering event and writes one matrix entry per package to the
-`matrix` output, with the entry file to test, the packages of this repository it depends on (directly or transitively)
-and the APT packages and named setup steps of the package and of the packages it depends on. The CI requirements of a package are read from its optional `ci.toml`:
+`matrix` output, with the entry file, the files to run the tests of, the packages of this repository it depends on
+(directly or transitively) and the APT packages and named setup steps of the package and of the packages it depends on.
+The CI requirements of a package are read from its optional `ci.toml`:
 
     apt = ["libgtk-4-dev"]  # APT packages to install
     setup = ["llvm"]        # named setup steps of .github/workflows/ci.yml
+    tests = ["other.spice"] # files to run the tests of, instead of the entry file (default: the entry file)
 
 Environment: EVENT (github.event_name), BASE (the commit to diff HEAD against, empty or all zeros to test everything).
 """
@@ -22,7 +24,7 @@ PACKAGES_DIR = Path("packages")
 GLOBAL_PATHS = (".github/workflows/ci.yml", ".github/scripts/")
 # Named setup steps, that .github/workflows/ci.yml implements
 KNOWN_SETUP_STEPS = {"llvm"}
-KNOWN_CI_KEYS = {"apt", "setup"}
+KNOWN_CI_KEYS = {"apt", "setup", "tests"}
 
 
 def fail(message: str):
@@ -51,6 +53,9 @@ def load_packages() -> tuple[dict, dict]:
                 fail(f"{ci_file}: '{key}' must be a list of strings")
         if unknown := set(ci.get("setup", [])) - KNOWN_SETUP_STEPS:
             fail(f"{ci_file}: unknown setup steps {sorted(unknown)}, known are {sorted(KNOWN_SETUP_STEPS)}")
+        for test_file in ci.get("tests", []):
+            if not (manifest_file.parent / test_file).is_file():
+                fail(f"{ci_file}: the test file '{test_file}' does not exist")
         ci_configs[name] = ci
     return manifests, ci_configs
 
@@ -94,6 +99,7 @@ def main():
         matrix.append({
             "name": name,
             "entry": manifests[name]["package"]["entry"],
+            "tests": ci_configs[name].get("tests") or [manifests[name]["package"]["entry"]],
             "deps": sorted(required - {name}),
             "apt": sorted({a for r in required for a in ci_configs[r].get("apt", [])}),
             "setup": sorted({s for r in required for s in ci_configs[r].get("setup", [])}),

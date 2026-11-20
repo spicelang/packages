@@ -18,6 +18,11 @@
       - any-glob-to-any-file:
           - 'packages/llvm/**/*'
 
+'manifest':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'packages/manifest/**/*'
+
 'semver':
   - changed-files:
       - any-glob-to-any-file:

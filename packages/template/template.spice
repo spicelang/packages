@@ -1,7 +1,5 @@
 // Std imports
 import "std/data/vector";
-import "std/io/dir";
-import "std/io/file";
 import "std/type/lambda";
 
 import "std/data/algorithm" as algorithm;
@@ -18,7 +16,7 @@ import "src/syntax";
 // ---------------------------------------------------------------------------------------------------------------------
 // An HTML template engine with a Jinja-like syntax.
 //
-// A TemplateEngine holds named templates (added from strings, files or a whole directory), compiles each of them once
+// A TemplateEngine holds named templates (added from strings, or from files with template-file.spice), compiles each of them once
 // and renders them with a TemplateValue: a tree of maps, lists, strings, numbers and booleans, built in code or parsed
 // from JSON. Output is HTML-escaped unless a value is marked safe.
 //
@@ -2633,41 +2631,6 @@ public f<bool> TemplateEngine.add<Text, Source>(const Text& name, const Source& 
         this.templates.pushBack(tpl);
     }
     return valid;
-}
-
-/**
- * Add a template from a file
- */
-public f<bool> TemplateEngine.addFile<Text>(const Text& name, string path) {
-    Result<String> content = readFile(path);
-    if !content.isOk() {
-        this.lastError = String("cannot read ") + path;
-        return false;
-    }
-    return this.add(name, content.unwrap());
-}
-
-/**
- * Add all files below a directory whose names end with the extension (all files if it is empty). The name of a
- * template is its path relative to the directory, with '/' as separator, e.g. "partials/card.html". Returns false if
- * the directory cannot be read or a template has errors (the last one is described in `lastError`).
- */
-public f<bool> TemplateEngine.loadDirectory(string path, string extension = ".html") {
-    Result<Vector<String>> listing = listDirRecursive(path);
-    if !listing.isOk() {
-        this.lastError = String("cannot read the directory ") + path;
-        return false;
-    }
-    const Vector<String> entries = listing.unwrap();
-    bool allValid = true;
-    for unsigned long i = 0l; i < entries.getSize(); i++ {
-        const String entry = entries.get(i);
-        if !entry.endsWith(extension) { continue; }
-        const String full = String(path) + "/" + entry;
-        if dirExists(full.getRaw()) { continue; }
-        if !this.addFile(entry, full.getRaw()) { allValid = false; }
-    }
-    return allValid;
 }
 
 public f<bool> TemplateEngine.has<Text>(const Text& name) {

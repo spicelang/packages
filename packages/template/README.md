@@ -8,12 +8,16 @@ control and error messages with template name and line. Pure Spice, no system li
 
 ```toml
 [dependencies]
-template = "^0.1.0"
+template = "^0.2.0"
 ```
 
 ```spice
 import "spice_packages/template/template";
+import "spice_packages/template/template-file"; // Only if you load templates from files
 ```
+
+The package has two modules: `template` is the engine and does no I/O, so it also works without an operating system, e.g.
+in WebAssembly; `template-file` loads templates from disk.
 
 ## Quick start
 
@@ -47,13 +51,15 @@ f<int> main() {
 }
 ```
 
-Templates usually live in files:
+Templates usually live in files, which `template-file` loads:
 
 ```spice
+import "spice_packages/template/template-file";
+
 TemplateEngine engine;
 engine.trimBlocks = true;   // whitespace options apply to templates added afterwards
 engine.lstripBlocks = true;
-if !engine.loadDirectory("templates") {       // all *.html below the directory, named "partials/card.html" etc.
+if !loadTemplateDirectory(engine, "templates") { // all *.html below the directory, named "partials/card.html" etc.
     printf("%s\n", engine.lastError.getRaw());
 }
 const String problems = engine.check();     // compile errors and references to missing templates, "" if fine
@@ -92,8 +98,6 @@ Result<TemplateValue> parsed = templateJson("{\"posts\": [{\"title\": \"Hello\"}
 | Method / field                         | Purpose                                                                       |
 |----------------------------------------|-------------------------------------------------------------------------------|
 | `add(name, source)`                    | Add or replace a template; `false` if it has errors (see `lastError`)          |
-| `addFile(name, path)`                  | Add a template from a file                                                    |
-| `loadDirectory(path, ext = ".html")`   | Add every file below a directory, named by its relative path                  |
 | `render(name, data)`                   | Render to a `Result<String>`; on failure `lastError` says what and where      |
 | `renderString(source, data)`           | Render a one-off source that can include, import and extend added templates  |
 | `check()`                              | Report of all compile errors and unknown include/import/extends targets       |
@@ -127,6 +131,15 @@ engine.addFilter("price", f<TemplateValue>(const TemplateValue& v, const Templat
 });
 // {{ item.cost|price }}  {{ item.cost|price(decimals=0) }}
 ```
+
+## Loading files
+
+`import "spice_packages/template/template-file";`
+
+| Function                                            | Purpose                                                         |
+|-----------------------------------------------------|-----------------------------------------------------------------|
+| `addTemplateFile(engine, name, path)`               | Add a template from a file; `false` if it cannot be read or has errors |
+| `loadTemplateDirectory(engine, path, ext = ".html")` | Add every file below a directory, named by its relative path    |
 
 ## Template syntax
 

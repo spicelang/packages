@@ -1,6 +1,6 @@
 [package]
 name = "template"
-version = "0.1.1"
+version = "0.2.0"
 description = "HTML template engine with a Jinja-like syntax: inheritance, macros, includes, filters and autoescaping"
 license = "MIT"
 authors = ["Marc Auberer <marc.auberer@chillibits.com>"]

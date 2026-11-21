@@ -1,0 +1,70 @@
+// Std imports
+import "std/data/vector";
+import "std/io/dir";
+import "std/io/file";
+
+// Own imports
+import "template";
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Loading templates from disk. The rest of the package does no I/O and is in template.spice, so that it also works where
+// there is no operating system, e.g. in WebAssembly.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Generic parameter type of the API
+type Text string|String; // Names
+
+/**
+ * Add a template from a file. Returns false if it cannot be read or has errors (described in `engine.lastError`).
+ */
+public f<bool> addTemplateFile<Text>(TemplateEngine& engine, const Text& name, string path) {
+    Result<String> content = readFile(path);
+    if !content.isOk() {
+        engine.lastError = String("cannot read ") + path;
+        return false;
+    }
+    return engine.add(name, content.unwrap());
+}
+
+/**
+ * Add all files below a directory whose names end with the extension (all files if it is empty). The name of a
+ * template is its path relative to the directory, with '/' as separator, e.g. "partials/card.html". Returns false if
+ * the directory cannot be read or a template has errors (the last one is described in `engine.lastError`).
+ */
+public f<bool> loadTemplateDirectory(TemplateEngine& engine, string path, string extension = ".html") {
+    Result<Vector<String>> listing = listDirRecursive(path);
+    if !listing.isOk() {
+        engine.lastError = String("cannot read the directory ") + path;
+        return false;
+    }
+    const Vector<String> entries = listing.unwrap();
+    bool allValid = true;
+    for unsigned long i = 0l; i < entries.getSize(); i++ {
+        const String entry = entries.get(i);
+        if !entry.endsWith(extension) { continue; }
+        const String full = String(path) + "/" + entry;
+        if dirExists(full.getRaw()) { continue; }
+        if !addTemplateFile(engine, entry, full.getRaw()) { allValid = false; }
+    }
+    return allValid;
+}
+
+// ============================================================== Tests ==============================================================
+
+#[test]
+f<bool> testLoadDirectory() {
+    const String dir = String("template-file-test");
+    assert mkDirs((dir + "/partials").getRaw(), MODE_ALL_RWX) == 0;
+    assert writeFile((dir + "/page.html").getRaw(), "<p>{% include \"partials/name.html\" %}</p>").isOk();
+    assert writeFile((dir + "/partials/name.html").getRaw(), "{{ name }}").isOk();
+    assert writeFile((dir + "/notes.txt").getRaw(), "{{ broken").isOk();
+    TemplateEngine engine;
+    assert loadTemplateDirectory(engine, dir.getRaw());
+    assert engine.has("page.html") && engine.has("partials/name.html") && !engine.has("notes.txt");
+    assert !addTemplateFile(engine, "missing.html", (dir + "/missing.html").getRaw());
+    assert !loadTemplateDirectory(engine, "template-file-test-missing");
+    assert deleteFile((dir + "/page.html").getRaw()) && deleteFile((dir + "/partials/name.html").getRaw());
+    assert deleteFile((dir + "/notes.txt").getRaw());
+    assert rmDir((dir + "/partials").getRaw()) == 0 && rmDir(dir.getRaw()) == 0;
+    return true;
+}

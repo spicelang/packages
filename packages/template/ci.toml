@@ -1,0 +1,2 @@
+# template-file.spice imports the entry file, so its tests run those of the whole package
+tests = ["template-file.spice"]

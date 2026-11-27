@@ -610,7 +610,19 @@ f<bool> Manifest.adoptEdit(const String& newText, const Vector<Dependency>& expe
         errors.pushBack(String("Could not edit ") + MANIFEST_FILE + " safely, please change it by hand");
         return false;
     }
-    *this = edited;
+    // Assign the fields one by one. '*this = edited' does not destruct the old value, so it leaked all of its strings and the
+    // dependencies
+    this.text = edited.text;
+    this.name = edited.name;
+    this.version = edited.version;
+    this.description = edited.description;
+    this.license = edited.license;
+    this.authors = edited.authors;
+    this.repository = edited.repository;
+    this.homepage = edited.homepage;
+    this.spice = edited.spice;
+    this.entry = edited.entry;
+    this.dependencies = edited.dependencies;
     return true;
 }
 
